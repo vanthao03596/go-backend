@@ -1,0 +1,82 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  BIN: bin/api
+  PKG: ./cmd/api
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  run:
+    desc: Run the API locally
+    cmds:
+      - go run {{.PKG}}
+
+  build:
+    desc: Build the API binary
+    sources: ['**/*.go', go.mod, go.sum]
+    generates: ['{{.BIN}}']
+    cmds:
+      - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o {{.BIN}} {{.PKG}}
+
+  test:
+    desc: Run unit tests with the race detector
+    cmds:
+      - go test -race -count=1 ./...
+
+  test:integration:
+    desc: Run integration tests (needs Docker)
+    cmds:
+      - go test -race -count=1 -tags=integration ./test/integration/...
+
+  lint:
+    desc: Run go vet and golangci-lint
+    cmds:
+      - go vet ./...
+      - golangci-lint run ./...
+
+  fmt:
+    desc: Format and fix lint issues where possible
+    cmds:
+      - golangci-lint fmt ./...
+      - golangci-lint run --fix ./...
+
+  tidy:
+    desc: Tidy go.mod and go.sum
+    cmds:
+      - go mod tidy
+
+  up:
+    desc: Start local Postgres
+    cmds:
+      - docker compose -f deploy/docker-compose.yml up -d --wait
+
+  down:
+    desc: Stop local Postgres and remove volumes
+    cmds:
+      - docker compose -f deploy/docker-compose.yml down -v
+
+  migrate:
+    desc: Apply pending migrations (phase 1)
+    cmds:
+      - goose -dir migrations postgres "$DATABASE_URL" up
+
+  migrate:status:
+    desc: Show migration status
+    cmds:
+      - goose -dir migrations postgres "$DATABASE_URL" status
+
+  sqlc:
+    desc: Regenerate sqlc code (phase 1)
+    cmds:
+      - sqlc generate
+
+  sqlc:check:
+    desc: Fail if generated sqlc code is stale
+    cmds:
+      - sqlc diff

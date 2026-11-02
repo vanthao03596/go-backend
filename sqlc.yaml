@@ -1,0 +1,26 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/db/queries
+    gen:
+      go:
+        package: sqlc
+        out: internal/db/sqlc
+        sql_package: pgx/v5
+        emit_interface: true
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        query_parameter_limit: 2
+        rename:
+          api_key: APIKey
+          api_key_id: APIKeyID
+          target_url: TargetURL
+        overrides:
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: time.Time
+              pointer: true

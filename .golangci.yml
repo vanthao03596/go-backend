@@ -1,0 +1,56 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - modernize
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - noctx
+    - nolintlint
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wrapcheck
+  settings:
+    sloglint:
+      no-mixed-args: true
+      kv-only: false
+      attr-only: false
+    wrapcheck:
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Join(
+        - .Wrap(
+      ignore-package-globs:
+        - github.com/thaopv/go-backend/*
+  exclusions:
+    generated: lax
+    paths:
+      - internal/db/sqlc
+    rules:
+      - path: _test\.go
+        linters: [gosec, wrapcheck, noctx]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/thaopv/go-backend
+  exclusions:
+    paths:
+      - internal/db/sqlc
