@@ -76,3 +76,44 @@ func TestRequestIDIsPropagated(t *testing.T) {
 		t.Errorf("X-Request-Id = %q, want trace-42", got)
 	}
 }
+
+func TestAPIMiddlewareSkipsDocsRoutes(t *testing.T) {
+	deny := func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+	}
+	srv := newTestServer(t, WithAPIMiddleware(deny))
+
+	cases := map[string]int{
+		"/api/v1/openapi.json":     http.StatusOK,
+		"/api/v1/openapi.yaml":     http.StatusOK,
+		"/api/v1/openapi-3.0.json": http.StatusOK,
+		"/api/v1/openapi-3.0.yaml": http.StatusOK,
+		"/api/v1/docs":             http.StatusOK,
+		"/api/v1/schemas/X":        http.StatusOK,
+		"/api/v1/links":            http.StatusUnauthorized,
+		"/api/v1/openapi":          http.StatusUnauthorized,
+	}
+	for path, want := range cases {
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != want {
+			t.Errorf("GET %s = %d, want %d", path, rec.Code, want)
+		}
+	}
+}
+
+func TestOpenAPIDeclaresBearerSecurity(t *testing.T) {
+	srv := newTestServer(t)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/openapi.json", nil))
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"securitySchemes":{"bearerAuth":{`) || !strings.Contains(body, `"scheme":"bearer","type":"http"`) {
+		t.Errorf("security scheme missing: %s", body)
+	}
+	if !strings.Contains(body, `"security":[{"bearerAuth":[]}]`) {
+		t.Errorf("top-level security missing: %s", body)
+	}
+}

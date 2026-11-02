@@ -1,14 +1,20 @@
 // Command api is the HTTP entry point. It wires config, logging and the server
-// and contains no business logic.
+// and contains no business logic. It also hosts the operator subcommand
+// "apikey create <name>" so key issuance reuses the same config and pool.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/thaopv/go-backend/internal/apikey"
 	"github.com/thaopv/go-backend/internal/config"
@@ -17,26 +23,43 @@ import (
 	"github.com/thaopv/go-backend/internal/link"
 	"github.com/thaopv/go-backend/internal/platform/slogx"
 	"github.com/thaopv/go-backend/internal/server"
+	"github.com/thaopv/go-backend/internal/server/middleware"
 )
 
+const usage = `usage:
+  api                       start the HTTP server
+  api apikey create <name>  issue an API key and print it once`
+
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(args []string, stdout io.Writer) error {
+	switch {
+	case len(args) == 0:
+		return serve()
+	case len(args) >= 3 && args[0] == "apikey" && args[1] == "create":
+		// Task expands CLI_ARGS unquoted, so a multi-word name arrives as
+		// several arguments. Join them back together.
+		return createAPIKey(strings.Join(args[2:], " "), stdout)
+	default:
+		return errors.New(usage)
+	}
+}
+
+// bootstrap loads config, builds the logger and opens the pool. Logs go to
+// logOut so the apikey subcommand can keep stdout for the key alone.
+func bootstrap(ctx context.Context, logOut io.Writer) (config.Config, *slog.Logger, *pgxpool.Pool, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		return err
+		return config.Config{}, nil, nil, err
 	}
 	level, _ := cfg.SlogLevel()
-	log := slogx.New(os.Stdout, level, cfg.IsDev())
+	log := slogx.New(logOut, level, cfg.IsDev())
 	slog.SetDefault(log)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	pool, err := db.NewPool(ctx, cfg.DatabaseURL, db.PoolOptions{
 		MaxConns:        cfg.DB.MaxConns,
@@ -45,6 +68,17 @@ func run() error {
 		MaxConnIdleTime: cfg.DB.MaxConnIdleTime,
 		ConnectTimeout:  cfg.DB.ConnectTimeout,
 	})
+	if err != nil {
+		return config.Config{}, nil, nil, err
+	}
+	return cfg, log, pool, nil
+}
+
+func serve() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, log, pool, err := bootstrap(ctx, os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -58,21 +92,47 @@ func run() error {
 	}
 
 	queries := sqlc.New(pool)
+	keySvc := apikey.NewService(apikey.NewRepository(queries))
 	linkSvc := link.NewService(link.NewRepository(queries), cfg.BaseURL, log)
-	linkHandler := link.NewHandler(linkSvc, log)
+	linkHandler := link.NewHandler(linkSvc, log,
+		link.WithRedirectRateLimit(middleware.RateLimitByIP(cfg.RateLimit.RedirectPerSecond)))
 
-	opts := []server.Option{
+	srv := server.New(cfg, log,
 		server.WithReadiness("postgres", pool.Ping),
 		server.WithFeature(linkHandler.Register),
+		// Order matters: throttle anonymous bursts before paying for a key lookup.
+		server.WithAPIMiddleware(
+			link.CreateRateLimit(middleware.RateLimitByIP(cfg.RateLimit.CreatePerSecond)),
+			apikey.Bearer(keySvc, log),
+		),
+	)
+	if len(cfg.TrustedProxies) == 0 {
+		log.Info("no TRUSTED_PROXIES set: client IP is the TCP peer")
+	} else {
+		log.Info("trusting X-Forwarded-For from proxies", "cidrs", cfg.TrustedProxies)
 	}
-	if cfg.DevAPIKeyID != 0 {
-		if _, err := queries.GetAPIKeyByID(ctx, cfg.DevAPIKeyID); err != nil {
-			return fmt.Errorf("DEV_API_KEY_ID=%d does not match an active api_keys row (run `task dev:seed`): %w", cfg.DevAPIKeyID, err)
-		}
-		log.Warn("DEV_API_KEY_ID set: management API is unauthenticated", "api_key_id", cfg.DevAPIKeyID)
-		opts = append(opts, server.WithAPIMiddleware(apikey.Static(cfg.DevAPIKeyID)))
-	}
-
-	srv := server.New(cfg, log, opts...)
 	return srv.Run(ctx)
+}
+
+func createAPIKey(name string, stdout io.Writer) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	_, log, pool, err := bootstrap(ctx, os.Stderr)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	svc := apikey.NewService(apikey.NewRepository(sqlc.New(pool)))
+	k, raw, err := svc.Create(ctx, name)
+	if err != nil {
+		return err
+	}
+	log.Info("api key created", "id", k.ID, "name", k.Name)
+	// The raw key is written once to stdout and nowhere else.
+	if _, err := fmt.Fprintln(stdout, raw); err != nil {
+		return fmt.Errorf("print api key: %w", err)
+	}
+	return nil
 }

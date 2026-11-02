@@ -48,6 +48,7 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 				slog.Int("bytes", sw.bytes),
 				slog.Duration("duration", time.Since(start)),
 				slog.String("remote", r.RemoteAddr),
+				slog.String("client_ip", ClientIPFrom(r)),
 				slog.String("user_agent", r.UserAgent()),
 			}
 			level := slog.LevelInfo

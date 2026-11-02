@@ -61,14 +61,10 @@ tasks:
     cmds:
       - docker compose -f deploy/docker-compose.yml down -v
 
-  dev:seed:
-    desc: Insert a development API key (id printed) for DEV_API_KEY_ID
+  apikey:create:
+    desc: "Issue an API key and print it once. Usage: task apikey:create -- <name>"
     cmds:
-      - >-
-        docker compose -f deploy/docker-compose.yml exec -T postgres
-        psql -U shortener -d shortener -tA -c
-        "INSERT INTO api_keys (key_hash, name) VALUES (sha256('dev'), 'dev')
-         ON CONFLICT (key_hash) DO UPDATE SET name = EXCLUDED.name RETURNING id;"
+      - go run {{.PKG}} apikey create {{.CLI_ARGS}}
 
   migrate:
     desc: Apply pending migrations (phase 1)

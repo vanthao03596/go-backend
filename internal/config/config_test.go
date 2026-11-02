@@ -11,7 +11,8 @@ func clearEnv(t *testing.T) {
 	for _, k := range []string{
 		"APP_ENV", "PORT", "BASE_URL", "LOG_LEVEL", "SHUTDOWN_TIMEOUT", "REQUEST_TIMEOUT",
 		"DATABASE_URL", "MIGRATE_ON_START", "DB_MAX_CONNS", "DB_MIN_CONNS",
-		"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME", "DB_CONNECT_TIMEOUT", "DEV_API_KEY_ID",
+		"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME", "DB_CONNECT_TIMEOUT",
+		"TRUSTED_PROXIES", "RATE_LIMIT_CREATE_PER_SEC", "RATE_LIMIT_REDIRECT_PER_SEC",
 	} {
 		t.Setenv(k, "")
 	}
@@ -42,13 +43,20 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-func TestDevAPIKeyRejectedOutsideDev(t *testing.T) {
+func TestTrustedProxiesParseAsList(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("DATABASE_URL", testDSN)
-	t.Setenv("APP_ENV", "prod")
-	t.Setenv("DEV_API_KEY_ID", "1")
-	if _, err := Load(); err == nil {
-		t.Fatal("Load accepted DEV_API_KEY_ID with APP_ENV=prod")
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8,::1/128")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 2 || cfg.TrustedProxies[1] != "::1/128" {
+		t.Errorf("TrustedProxies = %v", cfg.TrustedProxies)
+	}
+	if cfg.RateLimit.CreatePerSecond != 10 || cfg.RateLimit.RedirectPerSecond != 100 {
+		t.Errorf("rate limit defaults = %+v", cfg.RateLimit)
 	}
 }
 
@@ -65,6 +73,8 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		"unknown env":       {"APP_ENV", "staging"},
 		"unknown log level": {"LOG_LEVEL", "verbose"},
 		"min conns > max":   {"DB_MIN_CONNS", "50"},
+		"proxy not a cidr":  {"TRUSTED_PROXIES", "10.0.0.1"},
+		"zero rate limit":   {"RATE_LIMIT_CREATE_PER_SEC", "0"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

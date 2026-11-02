@@ -5,33 +5,67 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/thaopv/go-backend/internal/apikey"
+	"github.com/thaopv/go-backend/internal/server"
 	"github.com/thaopv/go-backend/internal/server/middleware"
 )
+
+// Middleware is a standard net/http middleware.
+type Middleware = func(http.Handler) http.Handler
 
 // Handler exposes the link service over HTTP: Huma operations under the
 // management API and a plain redirect handler at the root.
 type Handler struct {
-	svc *Service
-	log *slog.Logger
+	svc           *Service
+	log           *slog.Logger
+	redirectLimit Middleware
+}
+
+// HandlerOption customises a Handler.
+type HandlerOption func(*Handler)
+
+// WithRedirectRateLimit wraps GET and HEAD /{code} with mw. Rate limiting is
+// applied here rather than globally so health checks are never throttled.
+func WithRedirectRateLimit(mw Middleware) HandlerOption {
+	return func(h *Handler) { h.redirectLimit = mw }
 }
 
 // NewHandler builds a Handler around svc.
-func NewHandler(svc *Service, log *slog.Logger) *Handler {
-	return &Handler{svc: svc, log: log}
+func NewHandler(svc *Service, log *slog.Logger, opts ...HandlerOption) *Handler {
+	h := &Handler{svc: svc, log: log}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+// CreateRateLimit restricts mw to the create-link request so the rest of the
+// management API keeps its own budget. Mount it with server.WithAPIMiddleware
+// ahead of authentication: an unauthenticated burst must be rejected before it
+// costs a key lookup.
+func CreateRateLimit(mw Middleware) Middleware {
+	return chimw.Maybe(mw, func(r *http.Request) bool {
+		return r.Method == http.MethodPost && strings.TrimSuffix(r.URL.Path, "/") == server.APIBasePath+"/links"
+	})
 }
 
 // Register mounts the redirect on root and the CRUD operations on api.
 func (h *Handler) Register(root chi.Router, api huma.API) {
 	// HEAD is served so link previewers and uptime checks get the 302
 	// instead of a 405; it does not count as a click.
-	root.Get("/{code}", h.redirect)
-	root.Head("/{code}", h.redirect)
+	redirect := root
+	if h.redirectLimit != nil {
+		redirect = root.With(h.redirectLimit)
+	}
+	redirect.Get("/{code}", h.redirect)
+	redirect.Head("/{code}", h.redirect)
 
 	huma.Register(api, huma.Operation{
 		OperationID:   "create-link",

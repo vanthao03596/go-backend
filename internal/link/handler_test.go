@@ -12,8 +12,10 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/thaopv/go-backend/internal/apikey"
+	"github.com/thaopv/go-backend/internal/server/middleware"
 )
 
 // failingRepo wraps fakeRepo and fails GetByCodeForKey with an opaque error.
@@ -25,14 +27,22 @@ func (f failingRepo) GetByCodeForKey(context.Context, string, int64) (Link, erro
 	return Link{}, errors.New("get link for key: SQLSTATE 57P01 terminating connection")
 }
 
-func newTestRouter(t *testing.T, repo Repository) chi.Router {
+// asKey stands in for the bearer middleware and acts as api_keys.id 1.
+func asKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(apikey.WithID(r.Context(), 1)))
+	})
+}
+
+func newTestRouter(t *testing.T, repo Repository, opts ...HandlerOption) chi.Router {
 	t.Helper()
 	svc := newTestService(repo)
-	h := NewHandler(svc, slog.New(slog.DiscardHandler))
+	h := NewHandler(svc, slog.New(slog.DiscardHandler), opts...)
 
 	root := chi.NewRouter()
+	root.Use(chimw.ClientIPFromRemoteAddr)
 	root.Route("/api/v1", func(api chi.Router) {
-		api.Use(apikey.Static(1))
+		api.Use(asKey)
 		h.Register(root, humachi.New(api, huma.DefaultConfig("test", "0")))
 	})
 	return root
@@ -137,5 +147,77 @@ func TestCreateReturns201WithLocation(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"created_at":"`) || strings.Contains(rec.Body.String(), "+07:00") {
 		t.Errorf("timestamps should be UTC: %s", rec.Body.String())
+	}
+}
+
+func TestRedirectRateLimit(t *testing.T) {
+	repo := newFakeRepo()
+	l := seedLink(t, repo)
+	r := newTestRouter(t, repo, WithRedirectRateLimit(middleware.RateLimitByIP(3)))
+
+	codes := make([]int, 0, 4)
+	for range 4 {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+l.Code, nil))
+		codes = append(codes, rec.Code)
+	}
+	want := []int{302, 302, 302, 429}
+	for i, c := range codes {
+		if c != want[i] {
+			t.Fatalf("request %d = %d, want %d (all: %v)", i+1, c, want[i], codes)
+		}
+	}
+
+	// Health endpoints share the router but not the limiter.
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/links/"+l.Code, nil))
+	if rec.Code == http.StatusTooManyRequests {
+		t.Error("management API was throttled by the redirect limiter")
+	}
+}
+
+func TestCreateRateLimitOnlyMatchesCreate(t *testing.T) {
+	var hits int
+	h := chimw.ClientIPFromRemoteAddr(CreateRateLimit(middleware.RateLimitByIP(1))(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusNoContent)
+		})))
+	serve := func(method, path string) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		return rec.Code
+	}
+
+	if got := serve(http.MethodPost, "/api/v1/links"); got != http.StatusNoContent {
+		t.Fatalf("first POST = %d, want 204", got)
+	}
+	if got := serve(http.MethodPost, "/api/v1/links"); got != http.StatusTooManyRequests {
+		t.Fatalf("second POST = %d, want 429", got)
+	}
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/links"},
+		{http.MethodGet, "/api/v1/links/abc1234"},
+		{http.MethodDelete, "/api/v1/links/abc1234"},
+	} {
+		if got := serve(c.method, c.path); got != http.StatusNoContent {
+			t.Errorf("%s %s = %d, want 204 (should not be rate limited)", c.method, c.path, got)
+		}
+	}
+	if hits != 4 {
+		t.Errorf("handler hits = %d, want 4", hits)
+	}
+}
+
+func TestRateLimitRejectsUnresolvedClientIP(t *testing.T) {
+	// No ClientIP resolver in the chain: the limiter must not pool these
+	// requests into one shared bucket.
+	h := middleware.RateLimitByIP(100)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }

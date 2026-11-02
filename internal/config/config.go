@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -24,10 +25,21 @@ type Config struct {
 	MigrateOnStart bool   `env:"MIGRATE_ON_START"  envDefault:"false"`
 	DB             DBConfig
 
-	// DevAPIKeyID, when non-zero, makes every management API request act as
-	// this api_keys.id without authentication. Only honoured when Env is dev.
-	// Removed in roadmap phase 3 once bearer keys exist.
-	DevAPIKeyID int64 `env:"DEV_API_KEY_ID" envDefault:"0"`
+	// TrustedProxies lists the CIDR ranges of reverse proxies allowed to set
+	// X-Forwarded-For. Empty means the TCP peer is the client. Deliberately a
+	// CIDR list rather than a boolean: trusting the header from any peer lets
+	// a direct caller forge its IP and escape or weaponise rate limits.
+	TrustedProxies []string `env:"TRUSTED_PROXIES" envSeparator:","`
+	RateLimit      RateLimitConfig
+}
+
+// RateLimitConfig sets per-client-IP request budgets, each over a sliding
+// one second window.
+type RateLimitConfig struct {
+	// CreatePerSecond applies to POST /api/v1/links.
+	CreatePerSecond int `env:"RATE_LIMIT_CREATE_PER_SEC"   envDefault:"10"`
+	// RedirectPerSecond applies to GET and HEAD /{code}.
+	RedirectPerSecond int `env:"RATE_LIMIT_REDIRECT_PER_SEC" envDefault:"100"`
 }
 
 // DBConfig tunes the pgx connection pool. Zero values keep pgx defaults.
@@ -66,8 +78,14 @@ func (c Config) validate() error {
 	if c.DB.MinConns > c.DB.MaxConns {
 		return fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", c.DB.MinConns, c.DB.MaxConns)
 	}
-	if c.DevAPIKeyID != 0 && !c.IsDev() {
-		return fmt.Errorf("DEV_API_KEY_ID is only allowed when APP_ENV=dev, got APP_ENV=%s", c.Env)
+	for _, cidr := range c.TrustedProxies {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			return fmt.Errorf("TRUSTED_PROXIES entry %q is not a CIDR prefix: %w", cidr, err)
+		}
+	}
+	if c.RateLimit.CreatePerSecond <= 0 || c.RateLimit.RedirectPerSecond <= 0 {
+		return fmt.Errorf("rate limits must be positive, got create=%d redirect=%d",
+			c.RateLimit.CreatePerSecond, c.RateLimit.RedirectPerSecond)
 	}
 	return nil
 }

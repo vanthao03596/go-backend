@@ -139,7 +139,7 @@ Status: complete. Notes from implementation:
 - After code review: unmapped handler errors are logged with the request id and returned as a generic 500; `HEAD /{code}` is served and does not count a click; the click increment runs on a detached context so a client disconnect cannot cancel it; migration 00002 drops the partial live-code index the redirect query no longer matches; startup fails fast if `DEV_API_KEY_ID` has no active row; host validation rejects IPv4 shorthand (`127.1`, `0x7f.0.0.1`), CGNAT, NAT64 and IPv4-mapped IPv6.
 - Deleted codes stay reserved: the unique constraint on `code` spans soft-deleted rows, so an alias cannot be reused after deletion. This matches the roadmap default.
 
-### Phase 3: Auth and rate limiting (half a day)
+### Phase 3: Auth and rate limiting (half a day) - DONE 2026-11-02
 
 Goal: `/api/v1/*` requires a key, abuse is throttled.
 
@@ -150,6 +150,17 @@ Goal: `/api/v1/*` requires a key, abuse is throttled.
 - Security headers on redirect responses: `Referrer-Policy: strict-origin-when-cross-origin`, `Cache-Control: no-store`.
 
 Done when: unauthenticated POST returns 401, another key's link returns 404 on GET/DELETE, burst requests return 429.
+
+Status: complete. Notes from implementation (library docs checked against chi v5.5.0, httprate v0.16.1, Huma v2.40.0):
+
+- Keys are `sk_` plus 256 random bits in unpadded base64url (46 chars). Only the SHA-256 hash is stored. `apikey.Service.Authenticate` rejects anything without the prefix or over 128 chars before touching the database.
+- `internal/apikey.Bearer` is the chi middleware on the `/api/v1` group. Missing, malformed, unknown and revoked keys all return the same 401 with `WWW-Authenticate: Bearer` and a problem-details body. Backend failures are logged with the request id and masked as 500. Raw keys are never logged.
+- Huma's docs routes (`/api/v1/docs`, `/api/v1/openapi.{json,yaml}`, `/api/v1/schemas/*`) bypass the API middleware via `chi/middleware.Maybe` so the spec stays public. The spec declares a `bearerAuth` scheme and applies it to every operation.
+- `DEV_API_KEY_ID`, `apikey.Static` and `task dev:seed` are gone. Issue keys with `task apikey:create -- <name>` (a `cmd/api apikey create` subcommand). The raw key is printed to stdout once; logs for that subcommand go to stderr.
+- httprate v0.16.1 deprecates `LimitByIP`, `LimitByRealIP` and `Limit`; the supported entry is `LimitBy` keyed off chi's `middleware.ClientIPFrom*` resolvers. The roadmap's `TRUSTED_PROXY=true` became `TRUSTED_PROXIES` (comma-separated CIDRs) because trusting `X-Forwarded-For` from any peer is spoofable and the library refuses to offer that mode. Empty means the TCP peer is the client (`ClientIPFromRemoteAddr`). Both resolvers fail closed; a request whose IP cannot be resolved is rejected with 400 rather than pooled into a shared bucket one bad actor could exhaust. IPv6 clients are bucketed by /64.
+- Limits: `RATE_LIMIT_CREATE_PER_SEC` (default 10) on `POST /api/v1/links` only, installed before `Bearer` so anonymous bursts never cost a key lookup. `RATE_LIMIT_REDIRECT_PER_SEC` (default 100) wraps `GET` and `HEAD /{code}` only, so health checks and the management API are never throttled by redirect traffic. 429 responses carry `Retry-After` and `X-RateLimit-*` headers and a problem-details body.
+- Redirect security headers (`Cache-Control: no-store`, `Referrer-Policy: strict-origin-when-cross-origin`) were already in place from phase 2.
+- The request log line now includes `client_ip`.
 
 ### Phase 4: Integration tests and CI (half a day)
 
