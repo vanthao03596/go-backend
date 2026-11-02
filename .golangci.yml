@@ -3,6 +3,8 @@ version: "2"
 run:
   timeout: 5m
   tests: true
+  build-tags:
+    - integration
 
 linters:
   default: standard
@@ -34,7 +36,7 @@ linters:
         - errors.Join(
         - .Wrap(
       ignore-package-globs:
-        - github.com/thaopv/go-backend/*
+        - github.com/vanthao03596/go-backend/*
         - github.com/danielgtaylor/huma/v2
   exclusions:
     generated: lax
@@ -51,7 +53,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/thaopv/go-backend
+        - github.com/vanthao03596/go-backend
   exclusions:
     paths:
       - internal/db/sqlc

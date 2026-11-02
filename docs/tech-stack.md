@@ -44,7 +44,9 @@ generic methods, goroutine leak profiles, `httptest.NewTestServer` for `testing/
 | Concurrency helpers | `golang.org/x/sync` | v0.24.0 | 2026-09-23 | `errgroup`, `semaphore`. |
 | Crypto extras | `golang.org/x/crypto` | v0.58.0 | 2026-10-09 | bcrypt, argon2 if you must store passwords. |
 | Assertions | `github.com/stretchr/testify` | v1.12.1 | 2026-08-17 | Optional; stdlib `testing` plus `cmp` is also fine. |
-| Integration tests | `github.com/testcontainers/testcontainers-go` | v0.44.0 | 2026-08-07 | Real Postgres in tests. Use `modules/postgres` at the same version. |
+| Integration tests | `github.com/testcontainers/testcontainers-go` | v0.44.0 | 2026-08-07 | Real Postgres in tests. Use `modules/postgres` at the same version. Needs a Docker socket; GitHub's `ubuntu-latest` has one. |
+| Container base | `gcr.io/distroless/static-debian13:nonroot` | rolling | - | Debian 13 is the current distroless base; the `-debian12` tags are deprecated upstream. Pin the suffix, unsuffixed tags will move. |
+| CI actions | `actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9`, `sqlc-dev/setup-sqlc@v5`, `docker/build-push-action@v7` | - | 2026-11 | Major versions as of 2026-11-02. setup-go reads `go-version-file: go.mod`. |
 | Time-dependent tests | `testing/synctest` | stdlib | - | 1.27 adds `synctest.Sleep` and `httptest.NewTestServer`. |
 | Lint | `github.com/golangci/golangci-lint/v2` | v2.15.0 | 2026-10-16 | Bundles the modernize analyzer. Also run `go vet` and `go fix`. |
 | Task runner | `github.com/go-task/task/v3` | v3.54.0 | 2026-10-01 | Taskfile.yml. Makefile is an acceptable substitute. |

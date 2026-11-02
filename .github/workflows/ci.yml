@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.15
+  SQLC_VERSION: "1.31.1"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet -tags=integration ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+  sqlc:
+    name: sqlc drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: sqlc-dev/setup-sqlc@v5
+        with:
+          sqlc-version: ${{ env.SQLC_VERSION }}
+      - name: Generated code is up to date
+        run: sqlc diff
+
+  test:
+    name: Unit and integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+      - name: Integration tests (testcontainers)
+        run: go test -race -count=1 -tags=integration ./test/integration/...
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: shortener
+          POSTGRES_PASSWORD: shortener
+          POSTGRES_DB: shortener
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shortener -d shortener"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: shortener:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test /healthz
+        run: |
+          docker run -d --name api --network host \
+            -e APP_ENV=prod \
+            -e LOG_LEVEL=info \
+            -e MIGRATE_ON_START=true \
+            -e DATABASE_URL='postgres://shortener:shortener@localhost:5432/shortener?sslmode=disable' \
+            shortener:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8080/healthz && curl -fsS http://localhost:8080/readyz; then
+              echo; echo "ready after $i attempts"; exit 0
+            fi
+            sleep 1
+          done
+          echo "api did not become healthy"; docker logs api; exit 1
+      - name: Container logs
+        if: always()
+        run: docker logs api || true

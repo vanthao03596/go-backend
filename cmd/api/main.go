@@ -16,14 +16,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/thaopv/go-backend/internal/apikey"
-	"github.com/thaopv/go-backend/internal/config"
-	"github.com/thaopv/go-backend/internal/db"
-	"github.com/thaopv/go-backend/internal/db/sqlc"
-	"github.com/thaopv/go-backend/internal/link"
-	"github.com/thaopv/go-backend/internal/platform/slogx"
-	"github.com/thaopv/go-backend/internal/server"
-	"github.com/thaopv/go-backend/internal/server/middleware"
+	"github.com/vanthao03596/go-backend/internal/apikey"
+	"github.com/vanthao03596/go-backend/internal/app"
+	"github.com/vanthao03596/go-backend/internal/config"
+	"github.com/vanthao03596/go-backend/internal/db"
+	"github.com/vanthao03596/go-backend/internal/db/sqlc"
+	"github.com/vanthao03596/go-backend/internal/platform/slogx"
 )
 
 const usage = `usage:
@@ -91,21 +89,7 @@ func serve() error {
 		}
 	}
 
-	queries := sqlc.New(pool)
-	keySvc := apikey.NewService(apikey.NewRepository(queries))
-	linkSvc := link.NewService(link.NewRepository(queries), cfg.BaseURL, log)
-	linkHandler := link.NewHandler(linkSvc, log,
-		link.WithRedirectRateLimit(middleware.RateLimitByIP(cfg.RateLimit.RedirectPerSecond)))
-
-	srv := server.New(cfg, log,
-		server.WithReadiness("postgres", pool.Ping),
-		server.WithFeature(linkHandler.Register),
-		// Order matters: throttle anonymous bursts before paying for a key lookup.
-		server.WithAPIMiddleware(
-			link.CreateRateLimit(middleware.RateLimitByIP(cfg.RateLimit.CreatePerSecond)),
-			apikey.Bearer(keySvc, log),
-		),
-	)
+	srv := app.New(cfg, log, pool)
 	if len(cfg.TrustedProxies) == 0 {
 		log.Info("no TRUSTED_PROXIES set: client IP is the TCP peer")
 	} else {

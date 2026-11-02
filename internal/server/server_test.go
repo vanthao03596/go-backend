@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thaopv/go-backend/internal/config"
-	"github.com/thaopv/go-backend/internal/server/middleware"
+	"github.com/vanthao03596/go-backend/internal/config"
+	"github.com/vanthao03596/go-backend/internal/server/middleware"
 )
 
 func newTestServer(t *testing.T, opts ...Option) *Server {

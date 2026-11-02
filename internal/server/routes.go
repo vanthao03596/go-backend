@@ -9,7 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
-	"github.com/thaopv/go-backend/internal/server/middleware"
+	"github.com/vanthao03596/go-backend/internal/server/middleware"
 )
 
 // APIBasePath is where the Huma-managed management API is mounted.

@@ -29,14 +29,27 @@ type Service struct {
 	now     func() time.Time
 }
 
+// ServiceOption customises a Service at construction time.
+type ServiceOption func(*Service)
+
+// WithNow replaces the clock the service uses for expiry decisions. Tests
+// inject a controllable clock so expiry can be exercised without sleeping.
+func WithNow(now func() time.Time) ServiceOption {
+	return func(s *Service) { s.now = now }
+}
+
 // NewService wires a Service. baseURL is the public origin used to build short URLs.
-func NewService(repo Repository, baseURL string, log *slog.Logger) *Service {
-	return &Service{
+func NewService(repo Repository, baseURL string, log *slog.Logger, opts ...ServiceOption) *Service {
+	s := &Service{
 		repo:    repo,
 		baseURL: strings.TrimRight(baseURL, "/"),
 		log:     log,
 		now:     time.Now,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // ShortURL renders the public URL for a code.

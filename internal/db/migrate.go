@@ -11,7 +11,7 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/database"
 
-	"github.com/thaopv/go-backend/migrations"
+	"github.com/vanthao03596/go-backend/migrations"
 )
 
 // Migrate applies every pending embedded migration using the given pool.

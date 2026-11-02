@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/thaopv/go-backend/internal/db/sqlc"
+	"github.com/vanthao03596/go-backend/internal/db/sqlc"
 )
 
 // PgRepository implements Repository over the sqlc-generated queries.

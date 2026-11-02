@@ -12,7 +12,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/go-chi/chi/v5"
 
-	"github.com/thaopv/go-backend/internal/config"
+	"github.com/vanthao03596/go-backend/internal/config"
 )
 
 // ReadinessCheck returns nil when a dependency is ready to serve traffic.

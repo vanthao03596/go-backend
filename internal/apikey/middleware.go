@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/thaopv/go-backend/internal/server/middleware"
+	"github.com/vanthao03596/go-backend/internal/server/middleware"
 )
 
 // Authenticator resolves a raw bearer token. *Service satisfies it; tests

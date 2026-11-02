@@ -34,10 +34,41 @@ tasks:
     cmds:
       - go test -race -count=1 -tags=integration ./test/integration/...
 
+  test:all:
+    desc: Run unit and integration tests
+    cmds:
+      - task: test
+      - task: test:integration
+
+  ci:
+    desc: Everything CI runs, locally
+    cmds:
+      - task: lint
+      - task: sqlc:check
+      - task: test:all
+      - task: image:build
+
+  image:build:
+    desc: Build the container image
+    cmds:
+      - docker build -t shortener:local .
+
+  image:run:
+    desc: Run the image against the compose Postgres on port 8080
+    cmds:
+      # PORT is forced after --env-file so the published port always matches.
+      # --add-host makes host.docker.internal resolve on Linux Docker too.
+      - >-
+        docker run --rm -p 8080:8080 --env-file .env
+        --add-host=host.docker.internal:host-gateway
+        -e PORT=8080
+        -e DATABASE_URL=postgres://shortener:shortener@host.docker.internal:${POSTGRES_HOST_PORT:-5434}/shortener?sslmode=disable
+        shortener:local
+
   lint:
     desc: Run go vet and golangci-lint
     cmds:
-      - go vet ./...
+      - go vet -tags=integration ./...
       - golangci-lint run ./...
 
   fmt:

@@ -8,14 +8,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
-	"github.com/thaopv/go-backend/internal/apikey"
-	"github.com/thaopv/go-backend/internal/server/middleware"
+	"github.com/vanthao03596/go-backend/internal/apikey"
+	"github.com/vanthao03596/go-backend/internal/server/middleware"
 )
 
 // failingRepo wraps fakeRepo and fails GetByCodeForKey with an opaque error.
@@ -220,4 +222,51 @@ func TestRateLimitRejectsUnresolvedClientIP(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
+}
+
+// TestRedirectExpiresUnderFakeClock drives the real HTTP stack over
+// httptest's in-memory network inside a synctest bubble. The service keeps
+// its default time.Now, which the bubble fakes, so the hour passes instantly.
+func TestRedirectExpiresUnderFakeClock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		repo := newFakeRepo()
+		svc := NewService(repo, "https://sho.rt", slog.New(slog.DiscardHandler))
+		h := NewHandler(svc, slog.New(slog.DiscardHandler))
+
+		root := chi.NewRouter()
+		root.Route("/api/v1", func(api chi.Router) {
+			api.Use(asKey)
+			h.Register(root, humachi.New(api, huma.DefaultConfig("test", "0")))
+		})
+		ts := httptest.NewTestServer(t, root)
+		client := ts.Client()
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+		exp := time.Now().Add(time.Hour)
+		l, err := svc.Create(t.Context(), 1, CreateParams{URL: "https://example.com/t", ExpiresAt: &exp})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		status := func() int {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/"+l.Code, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			return resp.StatusCode
+		}
+
+		if got := status(); got != http.StatusFound {
+			t.Fatalf("before expiry = %d, want 302", got)
+		}
+		synctest.Sleep(time.Hour + time.Second)
+		if got := status(); got != http.StatusGone {
+			t.Fatalf("after expiry = %d, want 410", got)
+		}
+	})
 }

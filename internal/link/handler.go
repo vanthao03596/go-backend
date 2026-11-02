@@ -12,9 +12,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
-	"github.com/thaopv/go-backend/internal/apikey"
-	"github.com/thaopv/go-backend/internal/server"
-	"github.com/thaopv/go-backend/internal/server/middleware"
+	"github.com/vanthao03596/go-backend/internal/apikey"
+	"github.com/vanthao03596/go-backend/internal/server"
+	"github.com/vanthao03596/go-backend/internal/server/middleware"
 )
 
 // Middleware is a standard net/http middleware.

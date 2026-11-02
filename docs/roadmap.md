@@ -90,7 +90,7 @@ Goal: `task run` starts a server that answers `/healthz`.
 
 Done when: `task up && task run` then `curl localhost:8080/healthz` returns 200, `task lint` is clean.
 
-Status: complete. Module path `github.com/thaopv/go-backend`. Uses stdlib `uuid` (v7) for request ids and `encoding/json/v2` for responses. `.env` is created from `.env.example` and git-ignored.
+Status: complete. Module path `github.com/vanthao03596/go-backend`. Uses stdlib `uuid` (v7) for request ids and `encoding/json/v2` for responses. `.env` is created from `.env.example` and git-ignored.
 
 ### Phase 1: Database layer (half a day) - DONE 2026-11-02
 
@@ -162,7 +162,7 @@ Status: complete. Notes from implementation (library docs checked against chi v5
 - Redirect security headers (`Cache-Control: no-store`, `Referrer-Policy: strict-origin-when-cross-origin`) were already in place from phase 2.
 - The request log line now includes `client_ip`.
 
-### Phase 4: Integration tests and CI (half a day)
+### Phase 4: Integration tests and CI (half a day) - DONE 2026-11-02
 
 Goal: the full stack is tested against a real Postgres on every push.
 
@@ -172,6 +172,16 @@ Goal: the full stack is tested against a real Postgres on every push.
 - `Dockerfile`: multi-stage, distroless or scratch, non-root, `CGO_ENABLED=0`.
 
 Done when: CI is green and `docker run` of the image serves `/healthz`.
+
+Status: complete locally (`task ci` is green, the image answers `/healthz` and `/readyz` against the compose Postgres). CI on GitHub has not run yet because the workflow has not been pushed. Notes from implementation (library docs checked against testcontainers-go v0.44.0, golangci-lint-action v9, setup-sqlc v5, Go 1.27 release notes):
+
+- `internal/app` is the composition root. `cmd/api` and the integration tests both call `app.New(cfg, log, pool, opts...)`, so tests exercise the wiring that ships rather than a copy of it. `app.WithClock` is the only test hook.
+- Integration tests live behind `//go:build integration` in `test/integration`. `TestMain` starts one `postgres:17-alpine` container (same image as compose) with `postgres.BasicWaitStrategies()`, opens a pool and applies the embedded migrations through `db.Migrate`. Every test then builds its own server with `httptest.NewUnstartedServer` so `BASE_URL` can be the listener's real address and the `short_url` the API returns is directly requestable. Tests isolate themselves by issuing their own API key; codes are random, so they run with `t.Parallel()` on one database. The whole suite takes about three seconds plus container start.
+- `testing/synctest` cannot wrap the real-Postgres tests: the package documentation says bubbles must avoid the network, and a goroutine blocked on a socket is not "durably blocked", so fake time would never advance. The expiry test against Postgres therefore moves an injected clock (`link.WithNow`) forward. `synctest` is used where it fits: `TestRedirectExpiresUnderFakeClock` in `internal/link` drives the real chi and Huma stack over `httptest.NewTestServer`'s in-memory network with the service's default `time.Now`, and `synctest.Sleep(time.Hour)` expires the link instantly.
+- Rate limits default to 1000 per second in the test config so ordinary tests never trip them; `TestCreateRateLimit` lowers the create limit to 2 and asserts the third anonymous POST is a 429 before any key lookup.
+- `.github/workflows/ci.yml` runs four parallel jobs: lint (`go vet -tags=integration`, `golangci-lint-action@v9` pinned to v2.15), sqlc drift (`setup-sqlc@v5` pinned to 1.31.1, `sqlc diff`), test (unit, then integration; Docker is available on `ubuntu-latest` so testcontainers needs no setup) and image (buildx with GHA layer cache, `push: false`, then `docker run --network host` against a `postgres:17-alpine` service and curl `/healthz` and `/readyz`). Nothing is pushed to a registry; add a login and `push: true` on `main` when a registry is chosen.
+- `Dockerfile`: `golang:1.27.3-trixie` builder with `--platform=$BUILDPLATFORM` and `GOOS`/`GOARCH` from buildx so multi-arch builds cross-compile instead of emulating; module and build caches via `--mount=type=cache`. Runtime is `gcr.io/distroless/static-debian13:nonroot` (uid 65532, no shell, ca-certificates and tzdata included). The image is about 5.5 MB. The Debian 12 distroless tags are deprecated upstream; `tech-stack.md` has been corrected.
+- `.golangci.yml` sets `run.build-tags: [integration]` so the integration package is linted too. Taskfile gained `test:all`, `image:build`, `image:run` and `ci`.
 
 ### Phase 5: Async click analytics (1 day)
 

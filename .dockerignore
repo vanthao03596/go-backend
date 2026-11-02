@@ -1,0 +1,14 @@
+.git
+.github
+.task
+bin
+deploy
+docs
+test
+.env
+.env.example
+*.md
+Dockerfile
+.dockerignore
+.golangci.yml
+Taskfile.yml
