@@ -183,7 +183,7 @@ Status: complete locally (`task ci` is green, the image answers `/healthz` and `
 - `Dockerfile`: `golang:1.27.3-trixie` builder with `--platform=$BUILDPLATFORM` and `GOOS`/`GOARCH` from buildx so multi-arch builds cross-compile instead of emulating; module and build caches via `--mount=type=cache`. Runtime is `gcr.io/distroless/static-debian13:nonroot` (uid 65532, no shell, ca-certificates and tzdata included). The image is about 5.5 MB. The Debian 12 distroless tags are deprecated upstream; `tech-stack.md` has been corrected.
 - `.golangci.yml` sets `run.build-tags: [integration]` so the integration package is linted too. Taskfile gained `test:all`, `image:build`, `image:run` and `ci`.
 
-### Phase 5: Async click analytics (1 day)
+### Phase 5: Async click analytics (1 day) - DONE 2026-11-02
 
 Goal: redirects stay fast under load and analytics are richer.
 
@@ -194,6 +194,24 @@ Goal: redirects stay fast under load and analytics are richer.
 - Nightly job (River periodic or cron) to purge clicks older than 90 days.
 
 Done when: redirect p99 under load test (`hey` or `vegeta`) is unchanged with or without analytics enabled.
+
+Status: complete. Notes from implementation (library docs checked against pgx v5.12.0, sqlc v1.31.1, Huma v2.40.0, Go 1.27 `testing/synctest`):
+
+- `internal/click` is the new bounded context. `link.Service.Resolve` no longer writes anything: it hands a `link.Click` (link id, timestamp, referrer, user agent) to a `link.ClickSink`, and `click.Buffer` is that sink. `link.Repository.IncrementClicks` and the `IncrementClick` query are gone; `click` owns every write to the counter.
+- `click.Buffer` is a bounded channel (`CLICK_BUFFER_SIZE`, default 10000) drained by one goroutine. It flushes every `CLICK_FLUSH_INTERVAL` (1s) or as soon as `CLICK_FLUSH_BATCH` (500) clicks are pending. One flush is one transaction: `COPY` into `clicks` through sqlc's `:copyfrom` (which adds `CopyFrom` to the generated `DBTX`, satisfied by both the pool and `pgx.Tx`), then one `UPDATE ... FROM unnest(ids, deltas)` for the counters. `Record` never blocks: a full buffer drops the click and the drop count is logged once per flush. A failed flush keeps its batch and retries on the next tick, up to three attempts, then drops it; while a batch is held, new clicks accumulate up to `CLICK_BUFFER_SIZE` and the size trigger is suspended so a sick database is not hammered. A deterministic failure (for example a click whose link row was hard-deleted, which the FK rejects) therefore costs the batches it lands in; links are only ever soft-deleted so this does not happen in practice. River is the upgrade path if delivery guarantees become a requirement. The flusher goroutine starts on the first click, so building the app without serving traffic leaks nothing.
+- Header values are sanitised before they reach Postgres: invalid UTF-8 and NUL bytes are stripped (Postgres `text` rejects both, which would fail a whole batch) and values are cut on a rune boundary at 2048 bytes for the referrer and 512 for the user agent. The referrer is reduced to scheme, host and path: query strings, fragments and user info routinely carry tokens and addresses, so they are never stored, and anything that is not an absolute http(s) URL is discarded. The table has matching `CHECK` constraints. No client address is stored.
+- `server.Server` grew `WithWorker` and `WithShutdownHook` plus a public `Shutdown(ctx)`. `Run` starts workers next to the listener; `Shutdown` drains HTTP and cancels workers under `SHUTDOWN_TIMEOUT`, then runs hooks in order under a second `SHUTDOWN_TIMEOUT` of their own so a slow client cannot starve the click flush. The click buffer's `Close` is a shutdown hook, so every redirect that answered 302 has enqueued its click before the drain. Integration tests call `Shutdown` from `t.Cleanup`.
+- Stats: `GET /api/v1/links/{code}/stats` returns `total_clicks` (the link's lifetime counter, which survives purges) and `days`, seven UTC calendar days oldest first, zero-filled, from `clicks` grouped by `(occurred_at AT TIME ZONE 'UTC')::date`. The `date` column is mapped to `time.Time` with an sqlc override. Ownership is checked through `link.Service.Get`, so `click` depends on `link` and never the reverse. Counts lag by at most one flush interval; the integration tests poll for them.
+- Retention: `CLICK_RETENTION` (default 2160h, 90 days). `click.Service.Purge` deletes in batches of 5000 by `ctid` so a backlog never holds one long lock; `clicks(occurred_at)` is indexed for it and `clicks(link_id, occurred_at)` for stats. The in-process purger runs one minute after start and then every `CLICK_PURGE_INTERVAL` (default 24h); set it to 0 and schedule `task clicks:purge` (`api clicks purge`) externally instead. River was not adopted: a ticker plus an idempotent `DELETE` covers the requirement without a job table.
+- Tests: the buffer and purger are tested under `testing/synctest` (fake tickers, no sleeps). Integration tests cover stats, header capture, the day boundary via the injected clock, scoping, and purge against real Postgres.
+- Load test (2026-11-02, MacBook, compose Postgres 17 in Docker, `hey -z 15s -c 50`, one hot code, previous commit versus this one, two rounds each):
+
+  | Binary | Requests/s | p50 | p90 | p99 | Slowest |
+  |---|---|---|---|---|---|
+  | Phase 4 (synchronous `UPDATE` per redirect) | 4.4k | 10.4 ms | 14.5 ms | 22.0 ms | 91 ms |
+  | Phase 5 (buffered flush) | 20.4k | 2.4 ms | 2.9 ms | 4.0 ms | 24 ms |
+
+  All 302s were counted: 675191 redirects served by the new binary produced exactly 675191 `clicks` rows, with no drop or flush-error log lines, and the lifetime counter reconciled with the old binary's share.
 
 ### Phase 6: Observability (half a day)
 

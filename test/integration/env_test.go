@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json/v2"
 	"io"
 	"net/http"
@@ -18,6 +19,10 @@ import (
 	"github.com/vanthao03596/go-backend/internal/config"
 	"github.com/vanthao03596/go-backend/internal/db/sqlc"
 )
+
+// flushInterval is how quickly the click buffer writes in tests. waitFor
+// polls for a few multiples of it.
+const flushInterval = 20 * time.Millisecond
 
 // clock is a controllable time source anchored to the real clock. Rows get
 // created_at from Postgres' now(), so staying close to wall time keeps the
@@ -60,13 +65,32 @@ func newEnv(t *testing.T, mutate func(*config.Config)) *env {
 		// Generous defaults so ordinary tests never trip a limiter. The rate
 		// limit test lowers them explicitly.
 		RateLimit: config.RateLimitConfig{CreatePerSecond: 1000, RedirectPerSecond: 1000},
+		// Fast flushes keep the eventually-consistent assertions quick. The
+		// in-process purger is off; TestClickPurgeKeepsRecentRows drives
+		// retention directly.
+		Clicks: config.ClickConfig{
+			BufferSize:    1000,
+			FlushInterval: flushInterval,
+			FlushBatch:    100,
+			Retention:     90 * 24 * time.Hour,
+			PurgeInterval: 0,
+		},
 	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
 
 	clk := &clock{}
-	ts.Config.Handler = app.New(cfg, logger, pool, app.WithClock(clk.Now)).Handler()
+	srv := app.New(cfg, logger, pool, app.WithClock(clk.Now))
+	// Cleanups run last-in first-out: stop traffic, then drain the buffer.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	})
+	ts.Config.Handler = srv.Handler()
 	ts.Start()
 	t.Cleanup(ts.Close)
 
@@ -128,7 +152,6 @@ func (e *env) do(method, path, key string, body any) response {
 // doAuth is do with a verbatim Authorization header value; empty sends none.
 func (e *env) doAuth(method, path, authorization string, body any) response {
 	e.t.Helper()
-
 	var payload io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -137,24 +160,46 @@ func (e *env) doAuth(method, path, authorization string, body any) response {
 		}
 		payload = bytes.NewReader(raw)
 	}
-	url := path
-	if !strings.HasPrefix(path, "http") {
-		url = e.base + path
-	}
-	req, err := http.NewRequestWithContext(e.t.Context(), method, url, payload)
-	if err != nil {
-		e.t.Fatalf("build request: %v", err)
-	}
+	req := e.newRequest(method, path, payload)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
+	return e.send(req)
+}
 
+// request builds a bodiless request with an optional bearer key so callers
+// can add headers before send.
+func (e *env) request(method, path, key string) *http.Request {
+	e.t.Helper()
+	req := e.newRequest(method, path, nil)
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	return req
+}
+
+func (e *env) newRequest(method, path string, body io.Reader) *http.Request {
+	e.t.Helper()
+	url := path
+	if !strings.HasPrefix(path, "http") {
+		url = e.base + path
+	}
+	req, err := http.NewRequestWithContext(e.t.Context(), method, url, body)
+	if err != nil {
+		e.t.Fatalf("build request: %v", err)
+	}
+	return req
+}
+
+// send performs req and reads the whole body.
+func (e *env) send(req *http.Request) response {
+	e.t.Helper()
 	resp, err := e.client.Do(req)
 	if err != nil {
-		e.t.Fatalf("%s %s: %v", method, path, err)
+		e.t.Fatalf("%s %s: %v", req.Method, req.URL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
@@ -162,6 +207,22 @@ func (e *env) doAuth(method, path, authorization string, body any) response {
 		e.t.Fatalf("read body: %v", err)
 	}
 	return response{Status: resp.StatusCode, Header: resp.Header, Body: raw}
+}
+
+// waitFor polls cond until it holds or a deadline passes. Click counts are
+// written by a background flusher, so assertions on them are eventual.
+func (e *env) waitFor(what string, cond func() bool) {
+	e.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(flushInterval / 2)
+	}
 }
 
 // decode unmarshals the response body into v, failing the test on bad JSON.

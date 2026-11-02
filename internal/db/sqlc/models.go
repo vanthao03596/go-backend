@@ -16,6 +16,14 @@ type APIKey struct {
 	RevokedAt *time.Time
 }
 
+type Click struct {
+	ID         int64
+	LinkID     int64
+	OccurredAt time.Time
+	Referrer   *string
+	UserAgent  *string
+}
+
 type Link struct {
 	ID         int64
 	Code       string

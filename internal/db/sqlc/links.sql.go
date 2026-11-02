@@ -87,16 +87,6 @@ func (q *Queries) GetLinkByCodeForAPIKey(ctx context.Context, code string, aPIKe
 	return i, err
 }
 
-const incrementClick = `-- name: IncrementClick :exec
-UPDATE links SET click_count = click_count + $1::bigint
-WHERE id = $2::bigint
-`
-
-func (q *Queries) IncrementClick(ctx context.Context, delta int64, linkID int64) error {
-	_, err := q.db.Exec(ctx, incrementClick, delta, linkID)
-	return err
-}
-
 const listLinksByAPIKey = `-- name: ListLinksByAPIKey :many
 SELECT id, code, target_url, api_key_id, click_count, expires_at, created_at, deleted_at FROM links
 WHERE api_key_id = $1::bigint

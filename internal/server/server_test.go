@@ -117,3 +117,67 @@ func TestOpenAPIDeclaresBearerSecurity(t *testing.T) {
 		t.Errorf("top-level security missing: %s", body)
 	}
 }
+
+func TestRunStartsWorkersAndRunsHooksOnShutdown(t *testing.T) {
+	workerStarted := make(chan struct{})
+	workerStopped := make(chan struct{})
+	hookRan := make(chan struct{})
+	srv := newTestServer(t,
+		WithWorker("w", func(ctx context.Context) error {
+			close(workerStarted)
+			<-ctx.Done()
+			close(workerStopped)
+			return ctx.Err()
+		}),
+		WithShutdownHook("h", func(context.Context) error {
+			// Workers must already be stopped when hooks run.
+			select {
+			case <-workerStopped:
+			default:
+				t.Error("hook ran before the worker stopped")
+			}
+			close(hookRan)
+			return nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Run(ctx) }()
+
+	select {
+	case <-workerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker never started")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	select {
+	case <-hookRan:
+	default:
+		t.Error("shutdown hook did not run")
+	}
+}
+
+func TestShutdownWithoutRunStillRunsHooks(t *testing.T) {
+	ran := false
+	want := errors.New("flush failed")
+	srv := newTestServer(t,
+		WithWorker("never started", func(ctx context.Context) error { <-ctx.Done(); return nil }),
+		WithShutdownHook("h", func(context.Context) error { ran = true; return want }),
+	)
+	err := srv.Shutdown(t.Context())
+	if !ran {
+		t.Fatal("hook did not run")
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("Shutdown = %v, want wrapped %v", err, want)
+	}
+}

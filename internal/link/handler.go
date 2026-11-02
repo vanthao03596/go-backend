@@ -217,7 +217,13 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
-	target, err := h.svc.Resolve(r.Context(), code, r.Method != http.MethodHead)
+	// HEAD requests are not visits. Referer is the only header worth keeping
+	// for analytics; no client address is recorded.
+	var visit *Visit
+	if r.Method != http.MethodHead {
+		visit = &Visit{Referrer: r.Referer(), UserAgent: r.UserAgent()}
+	}
+	target, err := h.svc.Resolve(r.Context(), code, visit)
 	switch {
 	case err == nil:
 		// Redirecting to a caller-supplied URL is the product. The target was

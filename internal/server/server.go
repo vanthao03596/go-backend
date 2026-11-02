@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -22,6 +23,24 @@ type ReadinessCheck func(ctx context.Context) error
 // (for things like redirects); api is the Huma instance mounted at /api/v1.
 type Feature func(root chi.Router, api huma.API)
 
+// Worker is a long-running background task started by Run alongside the
+// listener. It must return promptly once ctx is cancelled.
+type Worker func(ctx context.Context) error
+
+// ShutdownHook runs after the listener has drained, so no handler is still
+// producing work, and before Run returns. Use it to flush buffers.
+type ShutdownHook func(ctx context.Context) error
+
+type namedWorker struct {
+	name string
+	run  Worker
+}
+
+type namedHook struct {
+	name string
+	run  ShutdownHook
+}
+
 // Server wraps http.Server with the application's dependencies.
 type Server struct {
 	cfg           config.Config
@@ -30,6 +49,12 @@ type Server struct {
 	readiness     map[string]ReadinessCheck
 	features      []Feature
 	apiMiddleware []func(http.Handler) http.Handler
+	workers       []namedWorker
+	hooks         []namedHook
+
+	// Set by Run; nil when the server was only used through Handler.
+	stopWorkers context.CancelFunc
+	workersDone chan struct{}
 }
 
 // Option customises a Server at construction time.
@@ -49,6 +74,18 @@ func WithFeature(f Feature) Option {
 // after the global stack. Authentication lives here.
 func WithAPIMiddleware(mw ...func(http.Handler) http.Handler) Option {
 	return func(s *Server) { s.apiMiddleware = append(s.apiMiddleware, mw...) }
+}
+
+// WithWorker runs w for as long as the server serves. A worker that returns
+// early is logged; it does not stop the server.
+func WithWorker(name string, w Worker) Option {
+	return func(s *Server) { s.workers = append(s.workers, namedWorker{name: name, run: w}) }
+}
+
+// WithShutdownHook registers h to run during Shutdown, after the listener
+// has drained and in registration order.
+func WithShutdownHook(name string, h ShutdownHook) Option {
+	return func(s *Server) { s.hooks = append(s.hooks, namedHook{name: name, run: h}) }
 }
 
 // New builds a Server. It does not start listening.
@@ -89,18 +126,90 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		errCh <- nil
 	}()
+	s.startWorkers(ctx)
 
+	var listenErr error
 	select {
-	case err := <-errCh:
-		return err
+	case listenErr = <-errCh:
+		if listenErr == nil {
+			// ListenAndServe only returns nil after Shutdown; nobody else
+			// calls it, so this is unreachable in practice but keeps the
+			// select honest.
+			return nil
+		}
 	case <-ctx.Done():
 	}
 
 	s.log.Info("shutting down", "timeout", s.cfg.ShutdownTimeout)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
-	if err := s.http.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+	err := s.Shutdown(shutdownCtx)
+	if listenErr != nil {
+		return errors.Join(listenErr, err)
+	}
+	if err != nil {
+		return err
 	}
 	return <-errCh
+}
+
+// Shutdown stops the listener and cancels workers, bounded by ctx, then
+// runs the shutdown hooks in order under a fresh cfg.ShutdownTimeout. The
+// hooks get their own budget so a slow client draining the listener cannot
+// starve the click buffer flush; the worst case is therefore twice the
+// timeout. Run calls it; tests that only used Handler call it to release
+// the workers and hooks they wired. Calling it twice re-runs the hooks, so
+// call it once.
+func (s *Server) Shutdown(ctx context.Context) error {
+	var errs []error
+	if err := s.http.Shutdown(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("shutdown: %w", err))
+	}
+	if s.stopWorkers != nil {
+		s.stopWorkers()
+		select {
+		case <-s.workersDone:
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("workers did not stop: %w", ctx.Err()))
+		}
+	}
+	if len(s.hooks) > 0 {
+		hookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ShutdownTimeout)
+		defer cancel()
+		for _, h := range s.hooks {
+			if err := h.run(hookCtx); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown hook %s: %w", h.name, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) startWorkers(ctx context.Context) {
+	if len(s.workers) == 0 {
+		return
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	s.stopWorkers = cancel
+	s.workersDone = make(chan struct{})
+
+	var wg sync.WaitGroup
+	for _, w := range s.workers {
+		wg.Go(func() {
+			s.log.Info("worker started", "worker", w.name)
+			err := w.run(workerCtx)
+			switch {
+			case err != nil && !errors.Is(err, context.Canceled):
+				s.log.Error("worker stopped with error", "worker", w.name, "err", err)
+			case workerCtx.Err() == nil:
+				s.log.Warn("worker stopped early", "worker", w.name)
+			default:
+				s.log.Info("worker stopped", "worker", w.name)
+			}
+		})
+	}
+	go func() {
+		wg.Wait()
+		close(s.workersDone)
+	}()
 }

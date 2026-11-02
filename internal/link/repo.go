@@ -91,14 +91,6 @@ func (r *PgRepository) SoftDelete(ctx context.Context, code string, apiKeyID int
 	return nil
 }
 
-// IncrementClicks implements Repository.
-func (r *PgRepository) IncrementClicks(ctx context.Context, id, delta int64) error {
-	if err := r.q.IncrementClick(ctx, delta, id); err != nil {
-		return fmt.Errorf("increment click: %w", err)
-	}
-	return nil
-}
-
 func fromRow(row sqlc.Link) Link {
 	return Link{
 		ID:         row.ID,

@@ -31,6 +31,25 @@ type Config struct {
 	// a direct caller forge its IP and escape or weaponise rate limits.
 	TrustedProxies []string `env:"TRUSTED_PROXIES" envSeparator:","`
 	RateLimit      RateLimitConfig
+	Clicks         ClickConfig
+}
+
+// ClickConfig tunes click analytics: the in-process buffer that takes click
+// writes off the redirect path, and retention of the clicks table.
+type ClickConfig struct {
+	// BufferSize is how many clicks may wait for a flush. Beyond it clicks
+	// are dropped rather than slowing redirects.
+	BufferSize int `env:"CLICK_BUFFER_SIZE" envDefault:"10000"`
+	// FlushInterval bounds how long a click waits before it is written.
+	FlushInterval time.Duration `env:"CLICK_FLUSH_INTERVAL" envDefault:"1s"`
+	// FlushBatch flushes early once this many clicks are pending.
+	FlushBatch int `env:"CLICK_FLUSH_BATCH" envDefault:"500"`
+	// Retention is how long clicks rows are kept. The lifetime counter on
+	// the link is unaffected.
+	Retention time.Duration `env:"CLICK_RETENTION" envDefault:"2160h"`
+	// PurgeInterval is how often the in-process purger runs. Zero disables
+	// it; run "api clicks purge" from an external scheduler instead.
+	PurgeInterval time.Duration `env:"CLICK_PURGE_INTERVAL" envDefault:"24h"`
 }
 
 // RateLimitConfig sets per-client-IP request budgets, each over a sliding
@@ -86,6 +105,16 @@ func (c Config) validate() error {
 	if c.RateLimit.CreatePerSecond <= 0 || c.RateLimit.RedirectPerSecond <= 0 {
 		return fmt.Errorf("rate limits must be positive, got create=%d redirect=%d",
 			c.RateLimit.CreatePerSecond, c.RateLimit.RedirectPerSecond)
+	}
+	if c.Clicks.BufferSize <= 0 || c.Clicks.FlushBatch <= 0 || c.Clicks.FlushInterval <= 0 {
+		return fmt.Errorf("CLICK_BUFFER_SIZE, CLICK_FLUSH_BATCH and CLICK_FLUSH_INTERVAL must be positive, got %d, %d, %s",
+			c.Clicks.BufferSize, c.Clicks.FlushBatch, c.Clicks.FlushInterval)
+	}
+	if c.Clicks.Retention <= 0 {
+		return fmt.Errorf("CLICK_RETENTION must be positive, got %s", c.Clicks.Retention)
+	}
+	if c.Clicks.PurgeInterval < 0 {
+		return fmt.Errorf("CLICK_PURGE_INTERVAL must be zero or positive, got %s", c.Clicks.PurgeInterval)
 	}
 	return nil
 }

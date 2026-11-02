@@ -67,7 +67,10 @@ func TestLinkLifecycle(t *testing.T) {
 		t.Errorf("GET = %+v, want %+v", got, created)
 	}
 
-	// Redirect counts a click; HEAD does not.
+	// Redirect counts a click; HEAD does not. HEAD goes first so that, by
+	// the time the GET's click has been flushed, a wrongly counted HEAD
+	// would have been flushed too.
+	e.expectStatus(e.do(http.MethodHead, created.ShortURL, "", nil), http.StatusFound, "HEAD short url")
 	r = e.do(http.MethodGet, created.ShortURL, "", nil)
 	e.expectStatus(r, http.StatusFound, "GET short url")
 	if loc := r.Header.Get("Location"); loc != target {
@@ -79,11 +82,15 @@ func TestLinkLifecycle(t *testing.T) {
 	if rp := r.Header.Get("Referrer-Policy"); rp != "strict-origin-when-cross-origin" {
 		t.Errorf("Referrer-Policy = %q", rp)
 	}
-	e.expectStatus(e.do(http.MethodHead, created.ShortURL, "", nil), http.StatusFound, "HEAD short url")
 
-	r = e.do(http.MethodGet, "/api/v1/links/"+created.Code, key, nil)
-	e.expectStatus(r, http.StatusOK, "GET link after redirect")
-	e.decode(r, &got)
+	// The click is written by the background flusher, so the counter is
+	// eventually consistent.
+	e.waitFor("click_count to reach 1", func() bool {
+		r = e.do(http.MethodGet, "/api/v1/links/"+created.Code, key, nil)
+		e.expectStatus(r, http.StatusOK, "GET link after redirect")
+		e.decode(r, &got)
+		return got.ClickCount >= 1
+	})
 	if got.ClickCount != 1 {
 		t.Errorf("click_count = %d, want 1 (GET counts, HEAD does not)", got.ClickCount)
 	}

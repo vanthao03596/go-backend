@@ -97,6 +97,11 @@ tasks:
     cmds:
       - go run {{.PKG}} apikey create {{.CLI_ARGS}}
 
+  clicks:purge:
+    desc: Delete clicks older than CLICK_RETENTION (for cron when CLICK_PURGE_INTERVAL=0)
+    cmds:
+      - go run {{.PKG}} clicks purge
+
   migrate:
     desc: Apply pending migrations (phase 1)
     cmds:

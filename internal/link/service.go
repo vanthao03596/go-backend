@@ -24,6 +24,7 @@ const (
 // Service holds the business rules. It knows nothing about HTTP or SQL.
 type Service struct {
 	repo    Repository
+	clicks  ClickSink
 	baseURL string
 	log     *slog.Logger
 	now     func() time.Time
@@ -38,10 +39,17 @@ func WithNow(now func() time.Time) ServiceOption {
 	return func(s *Service) { s.now = now }
 }
 
+// WithClickSink sets where counted redirects are sent. Without it clicks are
+// discarded; the composition root always installs the click buffer.
+func WithClickSink(sink ClickSink) ServiceOption {
+	return func(s *Service) { s.clicks = sink }
+}
+
 // NewService wires a Service. baseURL is the public origin used to build short URLs.
 func NewService(repo Repository, baseURL string, log *slog.Logger, opts ...ServiceOption) *Service {
 	s := &Service{
 		repo:    repo,
+		clicks:  discardClicks{},
 		baseURL: strings.TrimRight(baseURL, "/"),
 		log:     log,
 		now:     time.Now,
@@ -127,34 +135,35 @@ func (s *Service) List(ctx context.Context, apiKeyID int64, encodedCursor string
 	return rows, next, nil
 }
 
-// clickWriteTimeout bounds the detached click increment.
-const clickWriteTimeout = 2 * time.Second
-
-// Resolve returns the target URL for a redirect. When countClick is true the
-// link's counter is incremented; callers pass false for HEAD requests so
-// previewers and health checks do not inflate the count.
+// Resolve returns the target URL for a redirect. When visit is non-nil the
+// click is handed to the ClickSink; callers pass nil for HEAD requests so
+// previewers and health checks do not inflate the count. Recording is
+// non-blocking and cannot fail the redirect.
 // It returns ErrNotFound for unknown codes and ErrGone for deleted or expired links.
-func (s *Service) Resolve(ctx context.Context, code string, countClick bool) (string, error) {
+func (s *Service) Resolve(ctx context.Context, code string, visit *Visit) (string, error) {
 	l, err := s.repo.GetByCode(ctx, code)
 	if err != nil {
 		return "", err
 	}
-	if l.DeletedAt != nil || l.Expired(s.now()) {
+	now := s.now()
+	if l.DeletedAt != nil || l.Expired(now) {
 		return "", ErrGone
 	}
-	if countClick {
-		// Synchronous for now (roadmap phase 5 moves this off the hot path).
-		// The write is detached from the request context so a client that
-		// disconnects right after the 302 cannot cancel it, and a failed
-		// increment must not break the redirect.
-		incCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clickWriteTimeout)
-		defer cancel()
-		if err := s.repo.IncrementClicks(incCtx, l.ID, 1); err != nil {
-			s.log.ErrorContext(ctx, "increment clicks", "code", code, "err", err)
-		}
+	if visit != nil {
+		s.clicks.Record(Click{
+			LinkID:     l.ID,
+			OccurredAt: now,
+			Referrer:   visit.Referrer,
+			UserAgent:  visit.UserAgent,
+		})
 	}
 	return l.TargetURL, nil
 }
+
+// discardClicks is the default sink: it drops every click.
+type discardClicks struct{}
+
+func (discardClicks) Record(Click) {}
 
 // Cursor encoding: base64url("<unix nanos>:<id>"). Opaque to clients.
 

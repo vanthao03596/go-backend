@@ -10,13 +10,17 @@ import (
 
 // fakeRepo is an in-memory Repository for service tests.
 type fakeRepo struct {
-	links       map[string]Link
-	nextID      int64
-	insertErrs  []error // consumed in order; nil means success
-	incErr      error
-	incCalls    int
-	incCtxCheck bool // when set, IncrementClicks fails if ctx is already done
+	links      map[string]Link
+	nextID     int64
+	insertErrs []error // consumed in order; nil means success
 }
+
+// recordingSink captures every click the service emits.
+type recordingSink struct {
+	clicks []Click
+}
+
+func (r *recordingSink) Record(c Click) { r.clicks = append(r.clicks, c) }
 
 func newFakeRepo() *fakeRepo { return &fakeRepo{links: map[string]Link{}} }
 
@@ -89,27 +93,8 @@ func (f *fakeRepo) SoftDelete(_ context.Context, code string, keyID int64) error
 	return nil
 }
 
-func (f *fakeRepo) IncrementClicks(ctx context.Context, id, delta int64) error {
-	f.incCalls++
-	if f.incErr != nil {
-		return f.incErr
-	}
-	if f.incCtxCheck {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-	}
-	for code, l := range f.links {
-		if l.ID == id {
-			l.ClickCount += delta
-			f.links[code] = l
-		}
-	}
-	return nil
-}
-
-func newTestService(repo Repository) *Service {
-	s := NewService(repo, "https://sho.rt/", slog.New(slog.DiscardHandler))
+func newTestService(repo Repository, opts ...ServiceOption) *Service {
+	s := NewService(repo, "https://sho.rt/", slog.New(slog.DiscardHandler), opts...)
 	s.now = func() time.Time { return time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC) }
 	return s
 }
@@ -190,7 +175,8 @@ func TestCreateValidation(t *testing.T) {
 
 func TestResolve(t *testing.T) {
 	repo := newFakeRepo()
-	svc := newTestService(repo)
+	sink := &recordingSink{}
+	svc := newTestService(repo, WithClickSink(sink))
 	ctx := t.Context()
 
 	live, _ := svc.Create(ctx, 1, CreateParams{URL: "https://example.com/live"})
@@ -201,69 +187,55 @@ func TestResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	target, err := svc.Resolve(ctx, live.Code, true)
+	visit := &Visit{Referrer: "https://ref.example/", UserAgent: "test/1.0"}
+	target, err := svc.Resolve(ctx, live.Code, visit)
 	if err != nil || target != "https://example.com/live" {
 		t.Fatalf("Resolve live = %q, %v", target, err)
 	}
-	if repo.links[live.Code].ClickCount != 1 {
-		t.Errorf("click_count = %d, want 1", repo.links[live.Code].ClickCount)
+	want := Click{LinkID: live.ID, OccurredAt: svc.now(), Referrer: visit.Referrer, UserAgent: visit.UserAgent}
+	if len(sink.clicks) != 1 || sink.clicks[0] != want {
+		t.Errorf("recorded clicks = %+v, want [%+v]", sink.clicks, want)
 	}
 
-	if _, err := svc.Resolve(ctx, "nope123", true); !errors.Is(err, ErrNotFound) {
+	if _, err := svc.Resolve(ctx, "nope123", visit); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown code = %v, want ErrNotFound", err)
 	}
-	if _, err := svc.Resolve(ctx, deleted.Code, true); !errors.Is(err, ErrGone) {
+	if _, err := svc.Resolve(ctx, deleted.Code, visit); !errors.Is(err, ErrGone) {
 		t.Errorf("deleted = %v, want ErrGone", err)
 	}
 
 	// Move the clock past the expiry.
 	svc.now = func() time.Time { return exp.Add(time.Second) }
-	if _, err := svc.Resolve(ctx, expiring.Code, true); !errors.Is(err, ErrGone) {
+	if _, err := svc.Resolve(ctx, expiring.Code, visit); !errors.Is(err, ErrGone) {
 		t.Errorf("expired = %v, want ErrGone", err)
 	}
+	if len(sink.clicks) != 1 {
+		t.Errorf("failed resolves must not record clicks, got %d", len(sink.clicks))
+	}
 }
 
-func TestResolveSurvivesClickFailure(t *testing.T) {
+func TestResolveWithoutVisitDoesNotRecord(t *testing.T) {
 	repo := newFakeRepo()
-	repo.incErr = errors.New("db down")
+	sink := &recordingSink{}
+	svc := newTestService(repo, WithClickSink(sink))
+	l, _ := svc.Create(t.Context(), 1, CreateParams{URL: "https://example.com"})
+
+	if _, err := svc.Resolve(t.Context(), l.Code, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.clicks) != 0 {
+		t.Errorf("clicks = %d, want 0 for HEAD-style resolve", len(sink.clicks))
+	}
+}
+
+func TestResolveWithoutSinkStillRedirects(t *testing.T) {
+	repo := newFakeRepo()
 	svc := newTestService(repo)
 	l, _ := svc.Create(t.Context(), 1, CreateParams{URL: "https://example.com"})
 
-	target, err := svc.Resolve(t.Context(), l.Code, true)
+	target, err := svc.Resolve(t.Context(), l.Code, &Visit{})
 	if err != nil || target != "https://example.com" {
-		t.Fatalf("Resolve = %q, %v; redirect must not depend on click write", target, err)
-	}
-	if repo.incCalls != 1 {
-		t.Errorf("incCalls = %d, want 1", repo.incCalls)
-	}
-}
-
-func TestResolveWithoutCounting(t *testing.T) {
-	repo := newFakeRepo()
-	svc := newTestService(repo)
-	l, _ := svc.Create(t.Context(), 1, CreateParams{URL: "https://example.com"})
-
-	if _, err := svc.Resolve(t.Context(), l.Code, false); err != nil {
-		t.Fatal(err)
-	}
-	if repo.incCalls != 0 {
-		t.Errorf("incCalls = %d, want 0 for HEAD-style resolve", repo.incCalls)
-	}
-}
-
-func TestResolveClickSurvivesCancelledRequest(t *testing.T) {
-	repo := newFakeRepo()
-	repo.incCtxCheck = true
-	svc := newTestService(repo)
-	l, _ := svc.Create(t.Context(), 1, CreateParams{URL: "https://example.com"})
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel() // client went away before the increment ran
-	if _, err := svc.Resolve(ctx, l.Code, true); err != nil {
-		t.Fatal(err)
-	}
-	if repo.links[l.Code].ClickCount != 1 {
-		t.Errorf("click_count = %d, want 1: increment must use a detached context", repo.links[l.Code].ClickCount)
+		t.Fatalf("Resolve = %q, %v; redirect must not depend on a sink", target, err)
 	}
 }
 

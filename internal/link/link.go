@@ -39,6 +39,28 @@ type Cursor struct {
 	ID        int64
 }
 
+// Click is one counted redirect. The service emits it to a ClickSink; the
+// click package persists it. Referrer and UserAgent are raw header values,
+// empty when absent; the sink is responsible for sanitising them.
+type Click struct {
+	LinkID     int64
+	OccurredAt time.Time
+	Referrer   string
+	UserAgent  string
+}
+
+// Visit carries the request details of a redirect worth counting.
+type Visit struct {
+	Referrer  string
+	UserAgent string
+}
+
+// ClickSink receives clicks off the redirect path. Record must never block
+// and must never fail the caller: counting is best effort.
+type ClickSink interface {
+	Record(c Click)
+}
+
 // Domain errors. Handlers map these to HTTP statuses.
 var (
 	ErrNotFound      = errors.New("link not found")
@@ -63,6 +85,4 @@ type Repository interface {
 	List(ctx context.Context, apiKeyID int64, cursor Cursor, limit int32) ([]Link, error)
 	// SoftDelete marks a live link deleted. It returns ErrNotFound if nothing matched.
 	SoftDelete(ctx context.Context, code string, apiKeyID int64) error
-	// IncrementClicks adds delta to the link's click counter.
-	IncrementClicks(ctx context.Context, id, delta int64) error
 }

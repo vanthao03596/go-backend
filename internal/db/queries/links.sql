@@ -25,7 +25,3 @@ LIMIT sqlc.arg(page_size)::int;
 -- name: SoftDeleteLink :execrows
 UPDATE links SET deleted_at = now()
 WHERE code = $1 AND api_key_id = $2 AND deleted_at IS NULL;
-
--- name: IncrementClick :exec
-UPDATE links SET click_count = click_count + sqlc.arg(delta)::bigint
-WHERE id = sqlc.arg(link_id)::bigint;

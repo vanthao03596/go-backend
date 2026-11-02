@@ -38,7 +38,12 @@ func asKey(next http.Handler) http.Handler {
 
 func newTestRouter(t *testing.T, repo Repository, opts ...HandlerOption) chi.Router {
 	t.Helper()
-	svc := newTestService(repo)
+	return newTestRouterWithSink(t, repo, discardClicks{}, opts...)
+}
+
+func newTestRouterWithSink(t *testing.T, repo Repository, sink ClickSink, opts ...HandlerOption) chi.Router {
+	t.Helper()
+	svc := newTestService(repo, WithClickSink(sink))
 	h := NewHandler(svc, slog.New(slog.DiscardHandler), opts...)
 
 	root := chi.NewRouter()
@@ -63,10 +68,14 @@ func seedLink(t *testing.T, repo *fakeRepo) Link {
 func TestRedirectGetCountsClick(t *testing.T) {
 	repo := newFakeRepo()
 	l := seedLink(t, repo)
-	r := newTestRouter(t, repo)
+	sink := &recordingSink{}
+	r := newTestRouterWithSink(t, repo, sink)
 
+	req := httptest.NewRequest(http.MethodGet, "/"+l.Code, nil)
+	req.Header.Set("Referer", "https://ref.example/page")
+	req.Header.Set("User-Agent", "unit-test/1")
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+l.Code, nil))
+	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302", rec.Code)
@@ -77,15 +86,19 @@ func TestRedirectGetCountsClick(t *testing.T) {
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("Cache-Control = %q", cc)
 	}
-	if repo.links[l.Code].ClickCount != 1 {
-		t.Errorf("click_count = %d, want 1", repo.links[l.Code].ClickCount)
+	if len(sink.clicks) != 1 {
+		t.Fatalf("recorded %d clicks, want 1", len(sink.clicks))
+	}
+	if c := sink.clicks[0]; c.LinkID != l.ID || c.Referrer != "https://ref.example/page" || c.UserAgent != "unit-test/1" {
+		t.Errorf("click = %+v", c)
 	}
 }
 
 func TestRedirectHeadDoesNotCount(t *testing.T) {
 	repo := newFakeRepo()
 	l := seedLink(t, repo)
-	r := newTestRouter(t, repo)
+	sink := &recordingSink{}
+	r := newTestRouterWithSink(t, repo, sink)
 
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/"+l.Code, nil))
@@ -93,8 +106,8 @@ func TestRedirectHeadDoesNotCount(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Fatalf("HEAD status = %d, want 302", rec.Code)
 	}
-	if repo.links[l.Code].ClickCount != 0 {
-		t.Errorf("click_count = %d after HEAD, want 0", repo.links[l.Code].ClickCount)
+	if len(sink.clicks) != 0 {
+		t.Errorf("recorded %d clicks after HEAD, want 0", len(sink.clicks))
 	}
 }
 

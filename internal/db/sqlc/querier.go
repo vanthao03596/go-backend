@@ -6,9 +6,16 @@ package sqlc
 
 import (
 	"context"
+	"time"
 )
 
 type Querier interface {
+	// Applies one batch of per-link deltas. link_ids and deltas are parallel
+	// arrays; a link id must appear at most once per call.
+	AddClickCounts(ctx context.Context, linkIds []int64, deltas []int64) error
+	// Clicks per UTC calendar day in [since, until). Days without clicks are
+	// absent; the caller zero-fills.
+	CountClicksByDay(ctx context.Context, arg CountClicksByDayParams) ([]CountClicksByDayRow, error)
 	CreateAPIKey(ctx context.Context, keyHash []byte, name string) (APIKey, error)
 	CreateLink(ctx context.Context, arg CreateLinkParams) (Link, error)
 	GetAPIKeyByHash(ctx context.Context, keyHash []byte) (APIKey, error)
@@ -16,10 +23,13 @@ type Querier interface {
 	// Used by the redirect. Deleted rows are returned so the caller can answer 410.
 	GetLinkByCode(ctx context.Context, code string) (Link, error)
 	GetLinkByCodeForAPIKey(ctx context.Context, code string, aPIKeyID int64) (Link, error)
-	IncrementClick(ctx context.Context, delta int64, linkID int64) error
+	InsertClicks(ctx context.Context, arg []InsertClicksParams) (int64, error)
 	// Cursor pagination: pass the (created_at, id) of the last row seen, or
 	// a far-future timestamp and max bigint for the first page.
 	ListLinksByAPIKey(ctx context.Context, arg ListLinksByAPIKeyParams) ([]Link, error)
+	// Deletes at most batch_size rows older than before, oldest first, so a
+	// large backlog is removed in short transactions rather than one long lock.
+	PurgeClicksBefore(ctx context.Context, before time.Time, batchSize int32) (int64, error)
 	RevokeAPIKey(ctx context.Context, id int64) (int64, error)
 	SoftDeleteLink(ctx context.Context, code string, aPIKeyID int64) (int64, error)
 }

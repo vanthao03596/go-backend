@@ -1,6 +1,7 @@
 // Command api is the HTTP entry point. It wires config, logging and the server
-// and contains no business logic. It also hosts the operator subcommand
-// "apikey create <name>" so key issuance reuses the same config and pool.
+// and contains no business logic. It also hosts the operator subcommands
+// "apikey create <name>" and "clicks purge" so they reuse the same config
+// and pool.
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 
 	"github.com/vanthao03596/go-backend/internal/apikey"
 	"github.com/vanthao03596/go-backend/internal/app"
+	"github.com/vanthao03596/go-backend/internal/click"
 	"github.com/vanthao03596/go-backend/internal/config"
 	"github.com/vanthao03596/go-backend/internal/db"
 	"github.com/vanthao03596/go-backend/internal/db/sqlc"
@@ -26,7 +28,8 @@ import (
 
 const usage = `usage:
   api                       start the HTTP server
-  api apikey create <name>  issue an API key and print it once`
+  api apikey create <name>  issue an API key and print it once
+  api clicks purge          delete clicks older than CLICK_RETENTION`
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
@@ -43,6 +46,8 @@ func run(args []string, stdout io.Writer) error {
 		// Task expands CLI_ARGS unquoted, so a multi-word name arrives as
 		// several arguments. Join them back together.
 		return createAPIKey(strings.Join(args[2:], " "), stdout)
+	case len(args) == 2 && args[0] == "clicks" && args[1] == "purge":
+		return purgeClicks()
 	default:
 		return errors.New(usage)
 	}
@@ -118,5 +123,27 @@ func createAPIKey(name string, stdout io.Writer) error {
 	if _, err := fmt.Fprintln(stdout, raw); err != nil {
 		return fmt.Errorf("print api key: %w", err)
 	}
+	return nil
+}
+
+// purgeClicks is the cron-friendly form of the in-process purger, for
+// deployments that set CLICK_PURGE_INTERVAL=0 and schedule retention
+// externally.
+func purgeClicks() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, log, pool, err := bootstrap(ctx, os.Stdout)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	svc := click.NewService(click.NewRepository(pool, sqlc.New(pool)), log)
+	n, err := svc.Purge(ctx, cfg.Clicks.Retention)
+	if err != nil {
+		return fmt.Errorf("purge clicks (deleted %d): %w", n, err)
+	}
+	log.Info("clicks purged", "deleted", n, "retention", cfg.Clicks.Retention)
 	return nil
 }
