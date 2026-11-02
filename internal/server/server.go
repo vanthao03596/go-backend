@@ -9,18 +9,27 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/go-chi/chi/v5"
+
 	"github.com/thaopv/go-backend/internal/config"
 )
 
 // ReadinessCheck returns nil when a dependency is ready to serve traffic.
 type ReadinessCheck func(ctx context.Context) error
 
+// Feature registers a bounded context's routes. root is the top-level router
+// (for things like redirects); api is the Huma instance mounted at /api/v1.
+type Feature func(root chi.Router, api huma.API)
+
 // Server wraps http.Server with the application's dependencies.
 type Server struct {
-	cfg       config.Config
-	log       *slog.Logger
-	http      *http.Server
-	readiness map[string]ReadinessCheck
+	cfg           config.Config
+	log           *slog.Logger
+	http          *http.Server
+	readiness     map[string]ReadinessCheck
+	features      []Feature
+	apiMiddleware []func(http.Handler) http.Handler
 }
 
 // Option customises a Server at construction time.
@@ -29,6 +38,17 @@ type Option func(*Server)
 // WithReadiness registers a named dependency check for GET /readyz.
 func WithReadiness(name string, check ReadinessCheck) Option {
 	return func(s *Server) { s.readiness[name] = check }
+}
+
+// WithFeature mounts a feature's routes.
+func WithFeature(f Feature) Option {
+	return func(s *Server) { s.features = append(s.features, f) }
+}
+
+// WithAPIMiddleware adds middleware that runs only for /api/v1 routes,
+// after the global stack. Authentication lives here.
+func WithAPIMiddleware(mw ...func(http.Handler) http.Handler) Option {
+	return func(s *Server) { s.apiMiddleware = append(s.apiMiddleware, mw...) }
 }
 
 // New builds a Server. It does not start listening.

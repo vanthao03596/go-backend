@@ -4,8 +4,9 @@ VALUES ($1, $2, $3, $4)
 RETURNING *;
 
 -- name: GetLinkByCode :one
+-- Used by the redirect. Deleted rows are returned so the caller can answer 410.
 SELECT * FROM links
-WHERE code = $1 AND deleted_at IS NULL;
+WHERE code = $1;
 
 -- name: GetLinkByCodeForAPIKey :one
 SELECT * FROM links

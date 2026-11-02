@@ -46,6 +46,24 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash []byte) (APIKey, 
 	return i, err
 }
 
+const getAPIKeyByID = `-- name: GetAPIKeyByID :one
+SELECT id, key_hash, name, created_at, revoked_at FROM api_keys
+WHERE id = $1 AND revoked_at IS NULL
+`
+
+func (q *Queries) GetAPIKeyByID(ctx context.Context, id int64) (APIKey, error) {
+	row := q.db.QueryRow(ctx, getAPIKeyByID, id)
+	var i APIKey
+	err := row.Scan(
+		&i.ID,
+		&i.KeyHash,
+		&i.Name,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const revokeAPIKey = `-- name: RevokeAPIKey :execrows
 UPDATE api_keys SET revoked_at = now()
 WHERE id = $1 AND revoked_at IS NULL

@@ -3,6 +3,10 @@ INSERT INTO api_keys (key_hash, name)
 VALUES ($1, $2)
 RETURNING *;
 
+-- name: GetAPIKeyByID :one
+SELECT * FROM api_keys
+WHERE id = $1 AND revoked_at IS NULL;
+
 -- name: GetAPIKeyByHash :one
 SELECT * FROM api_keys
 WHERE key_hash = $1 AND revoked_at IS NULL;

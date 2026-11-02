@@ -35,6 +35,7 @@ linters:
         - .Wrap(
       ignore-package-globs:
         - github.com/thaopv/go-backend/*
+        - github.com/danielgtaylor/huma/v2
   exclusions:
     generated: lax
     paths:

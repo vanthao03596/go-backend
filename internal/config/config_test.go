@@ -11,7 +11,7 @@ func clearEnv(t *testing.T) {
 	for _, k := range []string{
 		"APP_ENV", "PORT", "BASE_URL", "LOG_LEVEL", "SHUTDOWN_TIMEOUT", "REQUEST_TIMEOUT",
 		"DATABASE_URL", "MIGRATE_ON_START", "DB_MAX_CONNS", "DB_MIN_CONNS",
-		"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME", "DB_CONNECT_TIMEOUT",
+		"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME", "DB_CONNECT_TIMEOUT", "DEV_API_KEY_ID",
 	} {
 		t.Setenv(k, "")
 	}
@@ -39,6 +39,16 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.DB.MaxConns != 10 || cfg.DB.MinConns != 2 {
 		t.Errorf("DB pool defaults = %d/%d, want 10/2", cfg.DB.MaxConns, cfg.DB.MinConns)
+	}
+}
+
+func TestDevAPIKeyRejectedOutsideDev(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATABASE_URL", testDSN)
+	t.Setenv("APP_ENV", "prod")
+	t.Setenv("DEV_API_KEY_ID", "1")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted DEV_API_KEY_ID with APP_ENV=prod")
 	}
 }
 

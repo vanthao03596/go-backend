@@ -3,10 +3,15 @@ package server
 import (
 	"net/http"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 
 	"github.com/thaopv/go-backend/internal/server/middleware"
 )
+
+// APIBasePath is where the Huma-managed management API is mounted.
+const APIBasePath = "/api/v1"
 
 func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
@@ -18,6 +23,19 @@ func (s *Server) routes() http.Handler {
 
 	r.Get("/healthz", s.handleHealthz)
 	r.Get("/readyz", s.handleReadyz)
+
+	r.Route(APIBasePath, func(api chi.Router) {
+		api.Use(s.apiMiddleware...)
+
+		cfg := huma.DefaultConfig("URL Shortener API", "1.0.0")
+		cfg.Info.Description = "Create short links and track redirects."
+		cfg.Servers = []*huma.Server{{URL: s.cfg.BaseURL + APIBasePath}}
+		hapi := humachi.New(api, cfg)
+
+		for _, f := range s.features {
+			f(r, hapi)
+		}
+	})
 
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "route not found")

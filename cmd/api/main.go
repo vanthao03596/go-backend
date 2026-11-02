@@ -10,8 +10,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/thaopv/go-backend/internal/apikey"
 	"github.com/thaopv/go-backend/internal/config"
 	"github.com/thaopv/go-backend/internal/db"
+	"github.com/thaopv/go-backend/internal/db/sqlc"
+	"github.com/thaopv/go-backend/internal/link"
 	"github.com/thaopv/go-backend/internal/platform/slogx"
 	"github.com/thaopv/go-backend/internal/server"
 )
@@ -54,8 +57,22 @@ func run() error {
 		}
 	}
 
-	srv := server.New(cfg, log,
+	queries := sqlc.New(pool)
+	linkSvc := link.NewService(link.NewRepository(queries), cfg.BaseURL, log)
+	linkHandler := link.NewHandler(linkSvc, log)
+
+	opts := []server.Option{
 		server.WithReadiness("postgres", pool.Ping),
-	)
+		server.WithFeature(linkHandler.Register),
+	}
+	if cfg.DevAPIKeyID != 0 {
+		if _, err := queries.GetAPIKeyByID(ctx, cfg.DevAPIKeyID); err != nil {
+			return fmt.Errorf("DEV_API_KEY_ID=%d does not match an active api_keys row (run `task dev:seed`): %w", cfg.DevAPIKeyID, err)
+		}
+		log.Warn("DEV_API_KEY_ID set: management API is unauthenticated", "api_key_id", cfg.DevAPIKeyID)
+		opts = append(opts, server.WithAPIMiddleware(apikey.Static(cfg.DevAPIKeyID)))
+	}
+
+	srv := server.New(cfg, log, opts...)
 	return srv.Run(ctx)
 }

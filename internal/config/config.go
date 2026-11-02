@@ -23,6 +23,11 @@ type Config struct {
 	DatabaseURL    string `env:"DATABASE_URL,required,notEmpty"`
 	MigrateOnStart bool   `env:"MIGRATE_ON_START"  envDefault:"false"`
 	DB             DBConfig
+
+	// DevAPIKeyID, when non-zero, makes every management API request act as
+	// this api_keys.id without authentication. Only honoured when Env is dev.
+	// Removed in roadmap phase 3 once bearer keys exist.
+	DevAPIKeyID int64 `env:"DEV_API_KEY_ID" envDefault:"0"`
 }
 
 // DBConfig tunes the pgx connection pool. Zero values keep pgx defaults.
@@ -60,6 +65,9 @@ func (c Config) validate() error {
 	}
 	if c.DB.MinConns > c.DB.MaxConns {
 		return fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", c.DB.MinConns, c.DB.MaxConns)
+	}
+	if c.DevAPIKeyID != 0 && !c.IsDev() {
+		return fmt.Errorf("DEV_API_KEY_ID is only allowed when APP_ENV=dev, got APP_ENV=%s", c.Env)
 	}
 	return nil
 }

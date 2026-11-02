@@ -46,9 +46,10 @@ func (q *Queries) CreateLink(ctx context.Context, arg CreateLinkParams) (Link, e
 
 const getLinkByCode = `-- name: GetLinkByCode :one
 SELECT id, code, target_url, api_key_id, click_count, expires_at, created_at, deleted_at FROM links
-WHERE code = $1 AND deleted_at IS NULL
+WHERE code = $1
 `
 
+// Used by the redirect. Deleted rows are returned so the caller can answer 410.
 func (q *Queries) GetLinkByCode(ctx context.Context, code string) (Link, error) {
 	row := q.db.QueryRow(ctx, getLinkByCode, code)
 	var i Link

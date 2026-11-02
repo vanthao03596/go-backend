@@ -114,7 +114,7 @@ Status: complete. Notes from implementation:
 - Compose Postgres is published on host port 5434 (override with `POSTGRES_HOST_PORT`). Ports 5432 and 5433 are taken on the development machine by a Homebrew Postgres and another project's container.
 - `/readyz` returns 503 with `postgres unavailable` when the pool cannot ping.
 
-### Phase 2: Core link feature (1 day)
+### Phase 2: Core link feature (1 day) - DONE 2026-11-02
 
 Goal: create and redirect work end to end.
 
@@ -126,6 +126,18 @@ Goal: create and redirect work end to end.
 - `service_test.go`: table tests with a fake repo. Cover code retry, alias validation, expiry, URL rejection.
 
 Done when: create via `/docs`, open the short URL in a browser, land on the target, `click_count` increments.
+
+Status: complete. Notes from implementation:
+
+- Huma is mounted on a chi sub-router at `/api/v1`, so docs live at `/api/v1/docs` and the spec at `/api/v1/openapi.json`. `Servers[0]` is set to `BASE_URL + /api/v1` so the generated paths resolve.
+- The redirect at `GET /{code}` is a plain chi handler. chi gives static routes priority, so `/healthz`, `/readyz` and `/api/...` are never shadowed by a code.
+- Redirect lookup returns deleted rows so the handler can answer 410 instead of 404. Deleted and expired both map to 410.
+- Until phase 3, the management API is authorised by `DEV_API_KEY_ID` (dev only, rejected by config in other envs). `task dev:seed` creates the matching row. Without it every `/api/v1` call returns 401 and redirects still work.
+- Features register through `server.WithFeature(func(root chi.Router, api huma.API))`; auth middleware for the API group goes through `server.WithAPIMiddleware`.
+- Known Huma quirk: with a `localhost` Host header the `$schema` link doubles the `/api/v1` prefix. With any real host it is correct. Cosmetic only.
+- Client-facing timestamps are rendered in UTC.
+- After code review: unmapped handler errors are logged with the request id and returned as a generic 500; `HEAD /{code}` is served and does not count a click; the click increment runs on a detached context so a client disconnect cannot cancel it; migration 00002 drops the partial live-code index the redirect query no longer matches; startup fails fast if `DEV_API_KEY_ID` has no active row; host validation rejects IPv4 shorthand (`127.1`, `0x7f.0.0.1`), CGNAT, NAT64 and IPv4-mapped IPv6.
+- Deleted codes stay reserved: the unique constraint on `code` spans soft-deleted rows, so an alias cannot be reused after deletion. This matches the roadmap default.
 
 ### Phase 3: Auth and rate limiting (half a day)
 

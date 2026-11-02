@@ -12,6 +12,8 @@ type Querier interface {
 	CreateAPIKey(ctx context.Context, keyHash []byte, name string) (APIKey, error)
 	CreateLink(ctx context.Context, arg CreateLinkParams) (Link, error)
 	GetAPIKeyByHash(ctx context.Context, keyHash []byte) (APIKey, error)
+	GetAPIKeyByID(ctx context.Context, id int64) (APIKey, error)
+	// Used by the redirect. Deleted rows are returned so the caller can answer 410.
 	GetLinkByCode(ctx context.Context, code string) (Link, error)
 	GetLinkByCodeForAPIKey(ctx context.Context, code string, aPIKeyID int64) (Link, error)
 	IncrementClick(ctx context.Context, delta int64, linkID int64) error
