@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
@@ -18,6 +20,7 @@ import (
 	"github.com/vanthao03596/go-backend/internal/config"
 	"github.com/vanthao03596/go-backend/internal/db/sqlc"
 	"github.com/vanthao03596/go-backend/internal/link"
+	"github.com/vanthao03596/go-backend/internal/platform/redisx"
 	"github.com/vanthao03596/go-backend/internal/server"
 	"github.com/vanthao03596/go-backend/internal/server/middleware"
 )
@@ -29,6 +32,15 @@ type options struct {
 	now            func() time.Time
 	tracerProvider trace.TracerProvider
 	meterProvider  metric.MeterProvider
+	redis          redis.Cmdable
+}
+
+// WithRedis puts a Redis cache in front of redirect lookups, with the TTLs
+// from cfg.Cache, behind a circuit breaker. Without it every redirect reads
+// Postgres. The caller owns the client and closes it after the server has
+// shut down.
+func WithRedis(rdb redis.Cmdable) Option {
+	return func(o *options) { o.redis = rdb }
 }
 
 // WithClock replaces the clock used for link expiry, click timestamps and the
@@ -49,9 +61,17 @@ func WithTelemetry(tp trace.TracerProvider, mp metric.MeterProvider) Option {
 	}
 }
 
+// OpenAPI returns the management API description the server built from cfg
+// serves. Nothing is connected or started: features only register their
+// operations while the server is assembled.
+func OpenAPI(cfg config.Config) *huma.OpenAPI {
+	return New(cfg, slog.New(slog.DiscardHandler), nil).OpenAPI()
+}
+
 // New wires every feature onto a server using pool for persistence. The
 // returned server is not listening yet; call Run, or use Handler with
-// httptest and Shutdown when done so the click buffer is drained.
+// httptest and Shutdown when done so the click buffer is drained. A nil
+// pool builds a server that can describe itself but not serve.
 func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, opts ...Option) *server.Server {
 	var o options
 	for _, opt := range opts {
@@ -83,6 +103,16 @@ func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, opts ...Option
 		clickOpts = append(clickOpts, click.WithNow(o.now))
 	}
 	linkOpts = append(linkOpts, link.WithClickSink(clickBuf))
+	if cfg.CursorSecret != "" {
+		linkOpts = append(linkOpts, link.WithCursorSecret([]byte(cfg.CursorSecret)))
+	}
+	if o.redis != nil {
+		cache := link.GuardCache(
+			link.NewRedisCache(o.redis, cfg.Cache.TTL, cfg.Cache.NegativeTTL),
+			redisx.NewBreaker(redisx.BreakerConfig{}, log.With("component", "link cache")),
+		)
+		linkOpts = append(linkOpts, link.WithCache(cache))
+	}
 	linkSvc := link.NewService(link.NewRepository(queries), cfg.BaseURL, log, linkOpts...)
 	linkHandler := link.NewHandler(linkSvc, log,
 		link.WithRedirectRateLimit(middleware.RateLimitByIP(cfg.RateLimit.RedirectPerSecond)))
@@ -103,6 +133,17 @@ func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, opts ...Option
 		// Runs after the listener drains, so every redirect that answered
 		// 302 has already enqueued its click.
 		server.WithShutdownHook("click buffer", clickBuf.Close),
+	}
+	if o.redis != nil {
+		srvOpts = append(srvOpts,
+			server.WithWorker("link cache repair", linkSvc.RunCacheRepair),
+			// The worker stops as shutdown begins; this catches tombstones
+			// queued before then and by deletes handled during the drain.
+			server.WithShutdownHook("link cache repair", func(ctx context.Context) error {
+				linkSvc.FlushCacheRepair(ctx)
+				return nil
+			}),
+		)
 	}
 	if cfg.Clicks.PurgeInterval > 0 {
 		srvOpts = append(srvOpts, server.WithWorker("click purger", func(ctx context.Context) error {

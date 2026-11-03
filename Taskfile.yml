@@ -49,6 +49,7 @@ tasks:
     cmds:
       - task: lint
       - task: sqlc:check
+      - task: openapi:check
       - task: test:all
       - task: image:build
 
@@ -58,7 +59,7 @@ tasks:
       - docker build --build-arg VERSION={{.VERSION}} -t shortener:local .
 
   image:run:
-    desc: Run the image against the compose Postgres on port 8080
+    desc: Run the image against the compose Postgres and Redis on port 8080
     cmds:
       # PORT is forced after --env-file so the published port always matches.
       # --add-host makes host.docker.internal resolve on Linux Docker too.
@@ -67,6 +68,7 @@ tasks:
         --add-host=host.docker.internal:host-gateway
         -e PORT=8080
         -e DATABASE_URL=postgres://shortener:shortener@host.docker.internal:${POSTGRES_HOST_PORT:-5434}/shortener?sslmode=disable
+        -e REDIS_URL=redis://:shortener@host.docker.internal:${REDIS_HOST_PORT:-6380}/0
         shortener:local
 
   lint:
@@ -87,7 +89,7 @@ tasks:
       - go mod tidy
 
   up:
-    desc: Start local Postgres
+    desc: Start local Postgres and Redis
     cmds:
       - '{{.COMPOSE}} up -d --wait'
 
@@ -102,7 +104,7 @@ tasks:
       - '{{.COMPOSE}} --profile observability up -d --wait'
 
   otel:down:
-    desc: Stop the observability stack, leaving Postgres running
+    desc: Stop the observability stack, leaving Postgres and Redis running
     cmds:
       - '{{.COMPOSE}} --profile observability rm --stop --force otel-collector jaeger prometheus'
 
@@ -135,3 +137,13 @@ tasks:
     desc: Fail if generated sqlc code is stale
     cmds:
       - sqlc diff
+
+  openapi:
+    desc: Export the OpenAPI description to api/openapi.yaml
+    cmds:
+      - go run {{.PKG}} openapi > api/openapi.yaml
+
+  openapi:check:
+    desc: Fail if api/openapi.yaml differs from what the code describes
+    cmds:
+      - go run {{.PKG}} openapi | diff -u api/openapi.yaml -

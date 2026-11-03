@@ -13,6 +13,7 @@ type fakeRepo struct {
 	links      map[string]Link
 	nextID     int64
 	insertErrs []error // consumed in order; nil means success
+	lookups    int     // GetByCode calls, i.e. redirect reads of the database
 }
 
 // recordingSink captures every click the service emits.
@@ -42,6 +43,7 @@ func (f *fakeRepo) Insert(_ context.Context, code, target string, keyID int64, e
 }
 
 func (f *fakeRepo) GetByCode(_ context.Context, code string) (Link, error) {
+	f.lookups++
 	l, ok := f.links[code]
 	if !ok {
 		return Link{}, ErrNotFound

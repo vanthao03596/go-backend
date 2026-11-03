@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -21,9 +22,17 @@ type Config struct {
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
 	RequestTimeout  time.Duration `env:"REQUEST_TIMEOUT"  envDefault:"15s"`
 
-	DatabaseURL    string `env:"DATABASE_URL,required,notEmpty"`
+	// DatabaseURL has no default and is required; validate enforces it so
+	// that Defaults can still describe an empty environment.
+	DatabaseURL    string `env:"DATABASE_URL"`
 	MigrateOnStart bool   `env:"MIGRATE_ON_START"  envDefault:"false"`
 	DB             DBConfig
+
+	// CursorSecret keys the HMAC that signs list pagination cursors. It must
+	// be at least MinCursorSecretLen bytes and shared by every replica.
+	// Required in prod; elsewhere an empty value means a random per-process
+	// key, so cursors stop working across restarts.
+	CursorSecret string `env:"CURSOR_SECRET"`
 
 	// TrustedProxies lists the CIDR ranges of reverse proxies allowed to set
 	// X-Forwarded-For. Empty means the TCP peer is the client. Deliberately a
@@ -32,8 +41,31 @@ type Config struct {
 	TrustedProxies []string `env:"TRUSTED_PROXIES" envSeparator:","`
 	RateLimit      RateLimitConfig
 	Clicks         ClickConfig
+	Cache          CacheConfig
 	Telemetry      TelemetryConfig
 }
+
+// MinCursorSecretLen is the shortest CURSOR_SECRET accepted: 32 bytes, the
+// output size of SHA-256, so the HMAC key is as strong as the hash.
+const MinCursorSecretLen = 32
+
+// CacheConfig enables the Redis cache in front of redirect lookups.
+type CacheConfig struct {
+	// RedisURL is a go-redis URL (redis://user:pass@host:6379/0?opt=v).
+	// Empty disables the cache and every redirect reads Postgres. Timeouts
+	// and pool settings may be given as query parameters; unset ones get
+	// cache-friendly defaults, see platform/redisx.
+	RedisURL string `env:"REDIS_URL"`
+	// TTL bounds how long a cached destination lives. Entries are kept
+	// coherent on create and delete, so the TTL only limits staleness when
+	// such an update fails to reach Redis, and bounds memory.
+	TTL time.Duration `env:"LINK_CACHE_TTL" envDefault:"10m"`
+	// NegativeTTL is how long an unknown code is remembered as missing.
+	NegativeTTL time.Duration `env:"LINK_CACHE_NEGATIVE_TTL" envDefault:"60s"`
+}
+
+// Enabled reports whether a Redis URL was configured.
+func (c CacheConfig) Enabled() bool { return c.RedisURL != "" }
 
 // TelemetryConfig switches OpenTelemetry export on. Everything else (OTLP
 // endpoint, headers, sampler, resource attributes, export intervals) is read
@@ -94,7 +126,24 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// Defaults returns the configuration an empty environment produces. It is
+// not validated (DATABASE_URL is empty), so it only suits building the
+// application without serving, as the OpenAPI export does: that output must
+// not depend on whoever runs it.
+func Defaults() Config {
+	cfg, err := env.ParseAsWithOptions[Config](env.Options{Environment: map[string]string{}})
+	if err != nil {
+		// Only a malformed envDefault tag can fail here, a programming error
+		// that TestDefaults catches.
+		panic(fmt.Sprintf("config defaults: %v", err))
+	}
+	return cfg
+}
+
 func (c Config) validate() error {
+	if c.DatabaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
 	if c.Port <= 0 || c.Port > 65535 {
 		return fmt.Errorf("PORT must be between 1 and 65535, got %d", c.Port)
 	}
@@ -127,6 +176,16 @@ func (c Config) validate() error {
 	}
 	if c.Clicks.PurgeInterval < 0 {
 		return fmt.Errorf("CLICK_PURGE_INTERVAL must be zero or positive, got %s", c.Clicks.PurgeInterval)
+	}
+	if c.Cache.TTL <= 0 || c.Cache.NegativeTTL <= 0 {
+		return fmt.Errorf("LINK_CACHE_TTL and LINK_CACHE_NEGATIVE_TTL must be positive, got %s and %s",
+			c.Cache.TTL, c.Cache.NegativeTTL)
+	}
+	switch {
+	case c.CursorSecret == "" && c.Env == "prod":
+		return errors.New("CURSOR_SECRET is required when APP_ENV=prod")
+	case c.CursorSecret != "" && len(c.CursorSecret) < MinCursorSecretLen:
+		return fmt.Errorf("CURSOR_SECRET must be at least %d bytes, got %d", MinCursorSecretLen, len(c.CursorSecret))
 	}
 	return nil
 }

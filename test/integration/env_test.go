@@ -83,6 +83,8 @@ func newEnvWith(t *testing.T, p *pgxpool.Pool, mutate func(*config.Config), opts
 			Retention:     90 * 24 * time.Hour,
 			PurgeInterval: 0,
 		},
+		// Only used by tests that pass app.WithRedis.
+		Cache: config.CacheConfig{TTL: 10 * time.Minute, NegativeTTL: time.Minute},
 	}
 	if mutate != nil {
 		mutate(&cfg)

@@ -43,6 +43,22 @@ jobs:
       - name: Generated code is up to date
         run: sqlc diff
 
+  openapi:
+    name: OpenAPI drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: api/openapi.yaml is up to date
+        run: |
+          go run ./cmd/api openapi > api/openapi.yaml
+          git diff --exit-code -- api/openapi.yaml || {
+            echo "::error file=api/openapi.yaml::stale; run 'task openapi' and commit the result"
+            exit 1
+          }
+
   test:
     name: Unit and integration tests
     runs-on: ubuntu-latest
@@ -93,6 +109,7 @@ jobs:
             -e APP_ENV=prod \
             -e LOG_LEVEL=info \
             -e MIGRATE_ON_START=true \
+            -e CURSOR_SECRET="$(openssl rand -base64 32)" \
             -e DATABASE_URL='postgres://shortener:shortener@localhost:5432/shortener?sslmode=disable' \
             shortener:ci
           for i in $(seq 1 20); do

@@ -57,6 +57,7 @@ func (s *Server) routes() http.Handler {
 		}
 		cfg.Security = []map[string][]string{{SecuritySchemeName: {}}}
 		hapi := humachi.New(api, cfg)
+		s.api = hapi
 
 		for _, f := range s.features {
 			f(r, hapi)

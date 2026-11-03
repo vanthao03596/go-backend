@@ -17,13 +17,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
 	"github.com/vanthao03596/go-backend/internal/db"
 )
 
-// postgresImage matches deploy/docker-compose.yml so tests and local
-// development run the same server version.
-const postgresImage = "postgres:17-alpine"
+// postgresImage and redisImage match deploy/docker-compose.yml so tests and
+// local development run the same server versions.
+const (
+	postgresImage = "postgres:17-alpine"
+	redisImage    = "redis:8.10-alpine"
+)
 
 // pool is shared by every test. Tests isolate themselves by issuing their own
 // API key; links are scoped to a key and codes are random, so nothing collides.
@@ -32,6 +36,10 @@ var pool *pgxpool.Pool
 // dsn reaches the test database, for tests that need a pool of their own
 // (for example one instrumented with a test tracer provider).
 var dsn string
+
+// redisURL reaches the test Redis. Only the cache tests use it; every other
+// test runs without a cache, as a deployment without REDIS_URL does.
+var redisURL string
 
 // logger discards application logs so test output stays readable. Switch to a
 // text handler on stderr when debugging a failing test.
@@ -65,6 +73,22 @@ func run(m *testing.M) int {
 	dsn, err = ctr.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "postgres connection string:", err)
+		return 1
+	}
+
+	rctr, err := tcredis.Run(ctx, redisImage)
+	defer func() {
+		if err := testcontainers.TerminateContainer(rctr); err != nil {
+			fmt.Fprintln(os.Stderr, "terminate redis container:", err)
+		}
+	}()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "start redis container:", err)
+		return 1
+	}
+	redisURL, err = rctr.ConnectionString(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "redis connection string:", err)
 		return 1
 	}
 

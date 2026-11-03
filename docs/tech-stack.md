@@ -41,13 +41,16 @@ generic methods, goroutine leak profiles, `httptest.NewTestServer` for `testing/
 | JWT / JWK | `github.com/lestrrat-go/jwx/v4` | v4.6.0 | 2026-10-23 | v4 is current. v3 (v3.4.0) still receives releases but new code should start on v4. |
 | OIDC | `github.com/coreos/go-oidc/v3` | v3.21.0 | 2026-09-01 | Delegate auth to an identity provider. |
 | Background jobs | `github.com/riverqueue/river` | v0.51.0 | 2026-11-01 | Postgres-backed queue, built on pgx. Pre-1.0 but widely used. |
-| Cache | `github.com/redis/go-redis/v9` | v9.23.0 | 2026-10-05 | Only if you actually need Redis. |
+| Cache | `github.com/redis/go-redis/v9` | v9.23.0 | 2026-10-05 | Redirect cache since phase 7. Its defaults (5s dial and read, 3 retries) suit a primary store, not a cache; `platform/redisx` tightens them. Do not use `Options.Limiter` as a circuit breaker: it also gates the handshake of new connections. Adds about 8 MB to the binary. Client-side caching is experimental in this version. |
+| Cache instrumentation | `github.com/redis/go-redis/extra/redisotel/v9` | v9.23.0 | 2026-10-05 | Tracing and metrics hooks with explicit providers. Turn off `WithDBStatement` (values) and `WithCallerEnabled` (stack walk per command). `extra/redisotel-native` is a process-wide singleton. |
+| Cache server | `redis` (Docker Official Image) | 8.10.3 | 2026-10-26 | `redis:8.10-alpine` in compose and tests: `allkeys-lru`, no persistence. Licensed RSALv2, SSPLv1 or AGPLv3; Valkey 9 is the BSD-licensed, protocol-compatible alternative. |
 | CORS | `github.com/rs/cors` | v1.11.1 | 2024-08-29 | Stable, small; chi also ships `cors` middleware. |
 | WebSockets | `github.com/gorilla/websocket` | v1.5.3 | 2024-06-14 | Maintained again since 2023. `github.com/coder/websocket` is a modern alternative. |
 | Concurrency helpers | `golang.org/x/sync` | v0.24.0 | 2026-09-23 | `errgroup`, `semaphore`. |
 | Crypto extras | `golang.org/x/crypto` | v0.58.0 | 2026-10-09 | bcrypt, argon2 if you must store passwords. |
 | Assertions | `github.com/stretchr/testify` | v1.12.1 | 2026-08-17 | Optional; stdlib `testing` plus `cmp` is also fine. |
-| Integration tests | `github.com/testcontainers/testcontainers-go` | v0.44.0 | 2026-08-07 | Real Postgres in tests. Use `modules/postgres` at the same version. Needs a Docker socket; GitHub's `ubuntu-latest` has one. |
+| Integration tests | `github.com/testcontainers/testcontainers-go` | v0.44.0 | 2026-08-07 | Real Postgres and Redis in tests. Use `modules/postgres` and `modules/redis` at the same version. Needs a Docker socket; GitHub's `ubuntu-latest` has one. |
+| Load testing | `github.com/tsenart/vegeta/v12`, `github.com/rakyll/hey` | v12.13.0, v0.1.5 | 2025-10-31, 2026-01-10 | vegeta for fixed-rate runs and many-URL target files, with nanosecond JSON reports. hey stores at most 1M results and prints latencies to 0.1 ms. See `docs/performance.md`. |
 | Container base | `gcr.io/distroless/static-debian13:nonroot` | rolling | - | Debian 13 is the current distroless base; the `-debian12` tags are deprecated upstream. Pin the suffix, unsuffixed tags will move. |
 | CI actions | `actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9`, `sqlc-dev/setup-sqlc@v5`, `docker/build-push-action@v7` | - | 2026-11 | Major versions as of 2026-11-02. setup-go reads `go-version-file: go.mod`. |
 | Time-dependent tests | `testing/synctest` | stdlib | - | 1.27 adds `synctest.Sleep` and `httptest.NewTestServer`. |
@@ -102,13 +105,14 @@ go-backend/
       sqlc/                # generated, committed, never edited by hand
     platform/
       otelx/                 # named like slogx so it imports next to go.opentelemetry.io/otel
+      redisx/                # go-redis client with cache defaults, circuit breaker
       slogx/
   migrations/
     0001_init.sql
   api/
-    openapi.yaml           # exported from Huma in CI, or hand-written if spec-first
+    openapi.yaml           # `api openapi` exports it from Huma; CI fails on drift
   deploy/
-    docker-compose.yml     # local Postgres; collector, Jaeger, Prometheus behind a profile
+    docker-compose.yml     # local Postgres and Redis; collector, Jaeger, Prometheus behind a profile
   test/
     integration/           # testcontainers-based end-to-end tests
 ```
@@ -138,5 +142,7 @@ go-backend/
 - Go web frameworks compared, 2026: https://glukhov.org/app-architecture/api-architecture/go-web-frameworks-stdlib-chi-gin-echo-fiber/
 - chi vs Gin vs Echo, 2026: https://reintech.io/blog/go-chi-vs-gin-vs-echo-web-framework-comparison-2026
 - Huma v2: https://pkg.go.dev/github.com/danielgtaylor/huma/v2
+- go-redis production usage: https://redis.io/docs/latest/develop/clients/go/produsage/
+- Redis key eviction (cache policies): https://redis.io/docs/latest/develop/reference/eviction/
 - OpenAPI Go generator comparison (Speakeasy, vendor): https://www.speakeasy.com/docs/sdks/languages/golang/oss-comparison-go
 - oapi-codegen vs ogen (Zenn, Jan 2026): https://zenn.dev/otakakot/articles/43653194611d42

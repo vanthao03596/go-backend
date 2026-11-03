@@ -61,6 +61,9 @@ type Server struct {
 	tracerProvider trace.TracerProvider
 	meterProvider  metric.MeterProvider
 
+	// api is the Huma instance under APIBasePath, set while routes are built.
+	api huma.API
+
 	// Set by Run; nil when the server was only used through Handler.
 	stopWorkers context.CancelFunc
 	workersDone chan struct{}
@@ -185,6 +188,10 @@ func peerIn(remoteAddr string, prefixes []netip.Prefix) bool {
 	}
 	return false
 }
+
+// OpenAPI returns the description of the operations under APIBasePath, as
+// served at APIBasePath + "/openapi.yaml".
+func (s *Server) OpenAPI() *huma.OpenAPI { return s.api.OpenAPI() }
 
 // Handler exposes the root handler, mainly for httptest.
 func (s *Server) Handler() http.Handler { return s.http.Handler }

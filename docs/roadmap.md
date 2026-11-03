@@ -20,7 +20,7 @@ Version 1 does one thing well: turn a long URL into a short code and redirect vi
 | API key auth | yes | OIDC / user accounts |
 | Rate limiting | yes | per-key quotas |
 | OpenAPI docs | yes | |
-| Redis cache for hot redirects | | yes |
+| Redis cache for hot redirects | yes (phase 7, optional via `REDIS_URL`) | |
 | QR code | | yes |
 | Bulk create | | yes |
 
@@ -280,7 +280,7 @@ Status: complete. Notes from implementation (docs and sources checked against ot
   Instrumenting is effectively free; exporting every trace is what costs. Production should set a ratio sampler. Metrics are unaffected by sampling.
 - The stripped binary grew from 13.7 MB to 24.3 MB, mostly gRPC and protobuf from the OTLP gRPC exporters. The OTLP/HTTP exporters would avoid gRPC if image size starts to matter.
 
-### Phase 7: Cache and hardening (optional, 1 day)
+### Phase 7: Cache and hardening (optional, 1 day) - DONE 2026-11-03
 
 Add only when redirect latency or DB load warrants it.
 
@@ -289,6 +289,74 @@ Add only when redirect latency or DB load warrants it.
 - Pagination cursors signed to prevent tampering.
 - Export `api/openapi.yaml` from Huma in CI and fail on uncommitted diff.
 - Load test and document numbers in `docs/performance.md`.
+
+Status: complete. The `code_pool` table was measured and not needed. Notes from implementation (docs and sources checked against go-redis v9.23.0, redisotel v9.23.0, Redis 8.10.3, testcontainers-go `modules/redis` v0.44.0, Huma v2.40.0, Go 1.27 `crypto/hmac`, vegeta v12.13.0):
+
+- Cache design:
+  - `link.Cache` stores a `Destination` per code: link id, target URL, expiry, and whether the link is deleted or missing.
+  - `link.RedisCache` keeps one string key per code, `shortener:link:v1:<code>`, holding a small JSON document. The version in the key changes with the format.
+  - TTLs are `LINK_CACHE_TTL` (default 10m) and `LINK_CACHE_NEGATIVE_TTL` (default 60s, for unknown codes).
+  - Expiry is stored rather than folded into the TTL, so an expired link answers 410 from the cache. A deleted link is a tombstone entry.
+  - An empty `REDIS_URL` disables the cache and every redirect reads Postgres.
+- Coherence. Readers *fill*: after a database read they `SET NX`. Writers *put*: after a create or delete they `SET`. A fill racing a put therefore never overwrites the newer state.
+  - Create writes the new entry. This warms the cache and replaces a cached 404 for a just-claimed alias.
+  - Delete writes the tombstone.
+  - Links have no update API, so these are the only writes.
+- The cache fails open:
+  - Any cache error means a database read. There is no fill after a failed get, since a failing cache would only fail again.
+  - A failed tombstone write is queued, bounded at 10k. The `link cache repair` worker retries it every second until Redis takes it. That is always safe because deletion is final: codes are never reused.
+  - Workers stop as soon as shutdown begins, before in-flight requests drain. A shutdown hook therefore makes one last attempt after the drain, which also covers deletes handled during it. Tombstones still unwritten are logged as an error, not returned: failing the shutdown would turn a clean exit into exit code 1. The queue lives in memory, so a crash loses it; the TTL bounds the damage.
+  - A failed put after create is only logged. The worst case is a cached 404 for up to the negative TTL.
+  - Redis is not part of `/readyz`, and a failed startup ping only logs.
+- Redis reads an expiry of 0 as "never". `NewRedisCache` therefore replaces non-positive TTLs with the defaults. An integration test caught entries written without expiry when the config left TTLs at zero.
+- `internal/platform/redisx` builds the client:
+  - The go-redis defaults suit a primary store, not a cache in front of a 1 ms database: 5s dial, 5s read, 3 retries, 5 dial attempts per connection.
+  - Unless `REDIS_URL` says otherwise, the defaults are 250ms dial, 100ms read and write, 100ms pool wait, no retries and one dial attempt.
+  - Any option can be set as a URL query parameter (`?read_timeout=250ms`); `ParseURL` maps snake_case option names. An explicit 0 means no timeout, so only absent settings get the defaults.
+  - Parse errors are stripped of the URL, which may hold a password.
+  - The docs and the source disagree: redis.io says read and write default to 3 s and retry backoff to 8 to 512 ms, while v9.23.0's `options.go` says 5 s and 10 ms to 1 s.
+- Circuit breaker (`redisx.Breaker`):
+  - Five consecutive transport failures open it for one second. Then a single call probes.
+  - Only a normal reply counts as success, including `redis.Nil` (a miss). Error replies count as failures: WRONGPASS, READONLY after a failover, or OOM mean every call is a wasted round trip. An integration test checks that a rejected password opens it. Cancelled callers count as neither.
+  - It wraps whole cache operations through `link.GuardCache`.
+  - The first version was installed as go-redis `Options.Limiter` and never recovered after an outage. go-redis consults the Limiter for every command, including the HELLO, AUTH and CLIENT SETINFO that a new connection runs inside the probing command, so the half-open breaker refused its own probe's handshake. The load test found it: the cache stayed bypassed after Redis came back. `TestCacheRecoversAfterAnOutage` starts against a black-holed proxy and fails with the Limiter version.
+- Telemetry:
+  - `redisotel` tracing and metrics hooks get explicit providers.
+  - `WithDBStatement(false)` because values hold target URLs. `WithCallerEnabled(false)` because caller attribution walks the stack on every command.
+  - Unlike otelpgx, redisotel opens spans without a recording parent. Its attributes use the older `db.system=redis`.
+  - `extra/redisotel-native`, which emits the semconv `db.client.operation.duration`, is a process-wide singleton (`GetObservabilityInstance().Init`) and does not fit per-component providers.
+  - go-redis's internal log lines go to slog through `redisx.RouteLogs`, which is process-wide.
+  - New metrics: `shortener.links.cache.lookups` by `shortener.cache.result` (hit, miss, error) and `shortener.links.cache.write_errors` by `shortener.cache.operation` (fill, put). redisotel adds `db.client.connections.*`.
+  - Verified in Jaeger. A cached redirect is `GET /{code}` with a single `get` child and no Postgres spans. An unknown code shows `get`, the `SELECT`, then a `set` for the negative entry.
+- Not used: go-redis client-side caching (RESP3 tracking with an in-process copy) is in v9.23.0 but marked experimental.
+- Local Redis is the compose service `redis:8.10-alpine`:
+  - `maxmemory 128mb` and `allkeys-lru`, which Redis recommends for a pure cache. No persistence, so a restart can only empty the cache, never serve a stale entry.
+  - Published like Postgres so `task image:run` reaches it through `host.docker.internal`, hence the development password `shortener`.
+  - Redis 8 is licensed RSALv2, SSPLv1 or AGPLv3. Valkey speaks the same protocol if that matters.
+  - Integration tests start the same image with testcontainers.
+- Code pool not built:
+  - 10,000 creates under load produced 0 collisions, against an expected 1.4e-5.
+  - At a billion links one create in about 3,500 needs a second `INSERT`.
+  - Revisit if `shortener.links.code_collisions` passes about 1% of `shortener.links.created`. Decision 1 moves to 8 characters well before that.
+- Cursors:
+  - The format is base64url of version, `created_at` nanos, id and a tag, 44 characters. The tag is HMAC-SHA256 over a context string, the version, the caller's API key id and the position, truncated to 128 bits (RFC 2104 allows truncation to half the hash).
+  - A cursor only works for the key it was issued to.
+  - `CURSOR_SECRET` (at least 32 bytes) is required when `APP_ENV=prod`. Elsewhere a random per-process key is used and a warning is logged.
+  - Cursors are signed, not encrypted: a client that decodes one sees the row's `created_at` and internal id. Encryption was considered. The stdlib's random-nonce AES-GCM caps one key at 2^32 messages; XChaCha20-Poly1305 from `x/crypto` would be the choice if ids ever need hiding.
+  - Unsigned cursors issued before this change, and cursors issued before a key rotation, now get 422. The client starts again from page one.
+- OpenAPI export:
+  - `api openapi` prints the YAML. This is Huma's documented pattern: a CLI command around `api.OpenAPI().YAML()` that never starts the server.
+  - It is built from `config.Defaults()`, an empty environment, so the output is the same for everyone. `app.OpenAPI` assembles the application without a pool or cache.
+  - `task openapi` writes `api/openapi.yaml`, `task openapi:check` diffs, and the CI job "OpenAPI drift" regenerates the file and runs `git diff --exit-code`.
+  - The output is byte-identical across runs. With the default `BASE_URL`, the served `/api/v1/openapi.yaml` equals the committed file.
+  - `DATABASE_URL` moved from the env tag's `required` into `validate()` so `Defaults` can parse an empty environment.
+  - The CI image smoke test now sets `CURSOR_SECRET`, since prod requires it.
+- Load test: see `docs/performance.md`. Briefly:
+  - The cache removes every database lookup from redirects. At 20k redirects/s, p99 drops from 13.9 ms to 1.3 to 5.1 ms, and Postgres CPU falls by about 60%.
+  - A paused or stopped Redis costs no wrong answers and no more latency than having no cache.
+  - Click recording, not lookups, is now the per-instance ceiling at about 28k to 30k clicks/s. See Open questions.
+- The stripped binary grew from 24.3 MB to 32.5 MB. go-redis v9.23 carries the whole Redis Stack command set.
+- Known issue, predates this phase and is not fixed: the `$schema` links in responses read `/api/v1/api/v1/schemas/...`, which answers 401. Huma prefixes the server URL, which already ends in `/api/v1`.
 
 ## Decisions (locked 2026-11-02)
 
@@ -310,6 +378,8 @@ Add only when redirect latency or DB load warrants it.
 | 4 | 7 if needed, else polish and docs |
 
 ## Open questions
+
+- The click pipeline records at most about 28k to 30k clicks/s per instance (one flusher, one Postgres backend; see `docs/performance.md`). With the cache, one instance can serve more redirects than that. Beyond adding replicas, choose one: several flush workers, counter deltas aggregated in memory and applied less often than rows are copied, or River (the phase 5 fallback).
 
 - Will the redirect domain differ from the API domain (for example `s.example.com` versus `api.example.com`)? If yes, split into two chi routers behind one server keyed on `Host`, or two binaries sharing `internal/`.
 - Should deleted codes be reusable? Default no, the unique index stays across soft deletes.

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/vanthao03596/go-backend/internal/apikey"
 	"github.com/vanthao03596/go-backend/internal/app"
@@ -25,6 +26,7 @@ import (
 	"github.com/vanthao03596/go-backend/internal/db"
 	"github.com/vanthao03596/go-backend/internal/db/sqlc"
 	"github.com/vanthao03596/go-backend/internal/platform/otelx"
+	"github.com/vanthao03596/go-backend/internal/platform/redisx"
 	"github.com/vanthao03596/go-backend/internal/platform/slogx"
 )
 
@@ -42,10 +44,15 @@ const maxTelemetryShutdown = 5 * time.Second
 // back to the build info stamped by go build.
 var version string
 
+// redisStartupPing bounds the startup reachability check. The cache is
+// optional, so a failed ping is logged and the server starts anyway.
+const redisStartupPing = 2 * time.Second
+
 const usage = `usage:
   api                       start the HTTP server
   api apikey create <name>  issue an API key and print it once
-  api clicks purge          delete clicks older than CLICK_RETENTION`
+  api clicks purge          delete clicks older than CLICK_RETENTION
+  api openapi               print the OpenAPI 3.1 description as YAML`
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
@@ -64,6 +71,8 @@ func run(args []string, stdout io.Writer) error {
 		return createAPIKey(strings.Join(args[2:], " "), stdout)
 	case len(args) == 2 && args[0] == "clicks" && args[1] == "purge":
 		return purgeClicks()
+	case len(args) == 1 && args[0] == "openapi":
+		return exportOpenAPI(stdout)
 	default:
 		return errors.New(usage)
 	}
@@ -161,13 +170,67 @@ func serve() error {
 		}
 	}
 
-	srv := app.New(cfg, log, pool, app.WithTelemetry(tel.TracerProvider, tel.MeterProvider))
+	appOpts := []app.Option{app.WithTelemetry(tel.TracerProvider, tel.MeterProvider)}
+	if cfg.Cache.Enabled() {
+		rdb, err := openRedis(ctx, cfg, log, tel)
+		if err != nil {
+			return err
+		}
+		// Closed after Run returns, by which time the server has drained and
+		// the cache repair worker has stopped.
+		defer func() { _ = rdb.Close() }()
+		appOpts = append(appOpts, app.WithRedis(rdb))
+	} else {
+		log.Info("no REDIS_URL set: redirects read Postgres directly")
+	}
+	if cfg.CursorSecret == "" {
+		log.Warn("no CURSOR_SECRET set: list cursors are signed with a random key and stop working after a restart or across replicas")
+	}
+
+	srv := app.New(cfg, log, pool, appOpts...)
 	if len(cfg.TrustedProxies) == 0 {
 		log.Info("no TRUSTED_PROXIES set: client IP is the TCP peer")
 	} else {
 		log.Info("trusting X-Forwarded-For from proxies", "cidrs", cfg.TrustedProxies)
 	}
 	return srv.Run(ctx)
+}
+
+// openRedis builds the cache client and checks once that Redis answers. An
+// unreachable Redis is not fatal: the cache fails open, so redirects read
+// Postgres until it recovers.
+func openRedis(ctx context.Context, cfg config.Config, log *slog.Logger, tel *otelx.Telemetry) (*redis.Client, error) {
+	redisx.RouteLogs(log)
+	rdb, err := redisx.NewClient(cfg.Cache.RedisURL, redisx.Options{
+		TracerProvider: tel.TracerProvider,
+		MeterProvider:  tel.MeterProvider,
+	})
+	if err != nil {
+		return nil, err
+	}
+	addr := rdb.Options().Addr
+	pingCtx, cancel := context.WithTimeout(ctx, redisStartupPing)
+	defer cancel()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		log.Warn("redis unreachable at startup; redirects read Postgres until it answers", "redis_addr", addr, "err", err)
+	} else {
+		log.Info("link cache enabled", "redis_addr", addr, "ttl", cfg.Cache.TTL, "negative_ttl", cfg.Cache.NegativeTTL)
+	}
+	return rdb, nil
+}
+
+// exportOpenAPI prints the API description built from the default
+// configuration, so the output is the same whoever runs it. CI compares it
+// with the committed api/openapi.yaml.
+func exportOpenAPI(stdout io.Writer) error {
+	spec, err := app.OpenAPI(config.Defaults()).YAML()
+	if err != nil {
+		return fmt.Errorf("render openapi: %w", err)
+	}
+	if _, err := stdout.Write(spec); err != nil {
+		return fmt.Errorf("write openapi: %w", err)
+	}
+	return nil
 }
 
 func createAPIKey(name string, stdout io.Writer) error {
