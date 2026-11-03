@@ -2,13 +2,20 @@ package server
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/vanthao03596/go-backend/internal/config"
 	"github.com/vanthao03596/go-backend/internal/server/middleware"
@@ -115,6 +122,92 @@ func TestOpenAPIDeclaresBearerSecurity(t *testing.T) {
 	}
 	if !strings.Contains(body, `"security":[{"bearerAuth":[]}]`) {
 		t.Errorf("top-level security missing: %s", body)
+	}
+}
+
+type schemaLinkOutput struct {
+	Body struct {
+		Name string `json:"name"`
+	}
+}
+
+// TestSchemaLinksUseBaseURL pins the `$schema` URL to BASE_URL whatever the
+// request says. Huma v2.40.0 built it from the request: a localhost Host
+// doubled the /api/v1 prefix, a plain-HTTP LAN host got https, and any client
+// could pick the host with X-Forwarded-Host.
+func TestSchemaLinksUseBaseURL(t *testing.T) {
+	deny := func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+	}
+	feature := WithFeature(func(_ chi.Router, api huma.API) {
+		huma.Get(api, "/thing", func(context.Context, *struct{}) (*schemaLinkOutput, error) {
+			return &schemaLinkOutput{}, nil
+		})
+		huma.Get(api, "/broken", func(context.Context, *struct{}) (*schemaLinkOutput, error) {
+			return nil, huma.Error404NotFound("gone")
+		})
+	})
+	// deny stands in for auth on every route except the two above, so
+	// following the link proves the schema route is public.
+	authOnOthers := WithAPIMiddleware(chimw.Maybe(deny, func(r *http.Request) bool {
+		return r.URL.Path != APIBasePath+"/thing" && r.URL.Path != APIBasePath+"/broken"
+	}))
+
+	cases := []struct {
+		name   string
+		base   string
+		host   string
+		header http.Header
+	}{
+		{name: "localhost host, localhost base", base: "http://localhost:8080", host: "localhost:8080"},
+		{name: "localhost host, public base", base: "https://sho.rt", host: "localhost:8080"},
+		{name: "plain-HTTP LAN host", base: "http://192.168.1.5:8080", host: "192.168.1.5:8080"},
+		{name: "loopback host", base: "https://sho.rt", host: "127.0.0.1:8080"},
+		{name: "spoofed X-Forwarded-Host", base: "https://sho.rt", host: "sho.rt", header: http.Header{"X-Forwarded-Host": {"evil.example"}}},
+		{name: "spoofed Forwarded", base: "https://sho.rt", host: "sho.rt", header: http.Header{"Forwarded": {"host=evil.example"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{Env: "test", BaseURL: tc.base, RequestTimeout: time.Second, ShutdownTimeout: time.Second}
+			srv := New(cfg, slog.New(slog.DiscardHandler), feature, authOnOthers)
+
+			for path, schema := range map[string]string{"/thing": "SchemaLinkOutputBody", "/broken": "ErrorModel"} {
+				req := httptest.NewRequest(http.MethodGet, APIBasePath+path, nil)
+				req.Host = tc.host
+				maps.Copy(req.Header, tc.header)
+				rec := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rec, req)
+
+				var body struct {
+					Schema string `json:"$schema"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatalf("GET %s: decode %q: %v", path, rec.Body.String(), err)
+				}
+				want := tc.base + APIBasePath + "/schemas/" + schema + ".json"
+				if body.Schema != want {
+					t.Errorf("GET %s: $schema = %q, want %q", path, body.Schema, want)
+				}
+				// The Link header was already right: relative, resolved
+				// against the request URL. It must stay that way.
+				if got, wantLink := rec.Header().Get("Link"), `<`+APIBasePath+`/schemas/`+schema+`.json>; rel="describedBy"`; got != wantLink {
+					t.Errorf("GET %s: Link = %q, want %q", path, got, wantLink)
+				}
+
+				// The link resolves, without credentials, on this server.
+				u, err := url.Parse(body.Schema)
+				if err != nil {
+					t.Fatalf("parse %q: %v", body.Schema, err)
+				}
+				follow := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(follow, httptest.NewRequest(http.MethodGet, u.Path, nil))
+				if follow.Code != http.StatusOK {
+					t.Errorf("GET %s = %d, want 200", u.Path, follow.Code)
+				}
+			}
+		})
 	}
 }
 

@@ -44,7 +44,9 @@ func (s *Server) routes() http.Handler {
 			api.Use(chimw.Maybe(mw, protected))
 		}
 
-		cfg.Servers = []*huma.Server{{URL: s.cfg.BaseURL + APIBasePath}}
+		apiURL := s.cfg.BaseURL + APIBasePath
+		cfg.Servers = []*huma.Server{{URL: apiURL}}
+		cfg = withCanonicalSchemaLinks(cfg, apiURL+cfg.SchemasPath+"/")
 		if cfg.Components == nil {
 			cfg.Components = &huma.Components{}
 		}

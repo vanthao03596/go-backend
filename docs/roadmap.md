@@ -134,7 +134,7 @@ Status: complete. Notes from implementation:
 - Redirect lookup returns deleted rows so the handler can answer 410 instead of 404. Deleted and expired both map to 410.
 - Until phase 3, the management API is authorised by `DEV_API_KEY_ID` (dev only, rejected by config in other envs). `task dev:seed` creates the matching row. Without it every `/api/v1` call returns 401 and redirects still work.
 - Features register through `server.WithFeature(func(root chi.Router, api huma.API))`; auth middleware for the API group goes through `server.WithAPIMiddleware`.
-- Known Huma quirk: with a `localhost` Host header the `$schema` link doubles the `/api/v1` prefix. With any real host it is correct. Cosmetic only.
+- Known Huma quirk: with a `localhost` Host header the `$schema` link doubles the `/api/v1` prefix. Fixed 2026-11-03; see the end of phase 7.
 - Client-facing timestamps are rendered in UTC.
 - After code review: unmapped handler errors are logged with the request id and returned as a generic 500; `HEAD /{code}` is served and does not count a click; the click increment runs on a detached context so a client disconnect cannot cancel it; migration 00002 drops the partial live-code index the redirect query no longer matches; startup fails fast if `DEV_API_KEY_ID` has no active row; host validation rejects IPv4 shorthand (`127.1`, `0x7f.0.0.1`), CGNAT, NAT64 and IPv4-mapped IPv6.
 - Deleted codes stay reserved: the unique constraint on `code` spans soft-deleted rows, so an alias cannot be reused after deletion. This matches the roadmap default.
@@ -173,7 +173,7 @@ Goal: the full stack is tested against a real Postgres on every push.
 
 Done when: CI is green and `docker run` of the image serves `/healthz`.
 
-Status: complete locally (`task ci` is green, the image answers `/healthz` and `/readyz` against the compose Postgres). CI on GitHub has not run yet because the workflow has not been pushed. Notes from implementation (library docs checked against testcontainers-go v0.44.0, golangci-lint-action v9, setup-sqlc v5, Go 1.27 release notes):
+Status: complete (`task ci` is green, the image answers `/healthz` and `/readyz` against the compose Postgres). GitHub Actions confirmed 2026-11-03: every push to `main` since this phase has passed, the latest at `2cb1e34` with all five jobs in about two minutes. The only annotation is GitHub's notice that `ubuntu-latest` moves to Ubuntu 26. Notes from implementation (library docs checked against testcontainers-go v0.44.0, golangci-lint-action v9, setup-sqlc v5, Go 1.27 release notes):
 
 - `internal/app` is the composition root. `cmd/api` and the integration tests both call `app.New(cfg, log, pool, opts...)`, so tests exercise the wiring that ships rather than a copy of it. `app.WithClock` is the only test hook.
 - Integration tests live behind `//go:build integration` in `test/integration`. `TestMain` starts one `postgres:17-alpine` container (same image as compose) with `postgres.BasicWaitStrategies()`, opens a pool and applies the embedded migrations through `db.Migrate`. Every test then builds its own server with `httptest.NewUnstartedServer` so `BASE_URL` can be the listener's real address and the `short_url` the API returns is directly requestable. Tests isolate themselves by issuing their own API key; codes are random, so they run with `t.Parallel()` on one database. The whole suite takes about three seconds plus container start.
@@ -356,7 +356,13 @@ Status: complete. The `code_pool` table was measured and not needed. Notes from 
   - A paused or stopped Redis costs no wrong answers and no more latency than having no cache.
   - Click recording, not lookups, is now the per-instance ceiling at about 28k to 30k clicks/s. See Open questions.
 - The stripped binary grew from 24.3 MB to 32.5 MB. go-redis v9.23 carries the whole Redis Stack command set.
-- Known issue, predates this phase and is not fixed: the `$schema` links in responses read `/api/v1/api/v1/schemas/...`, which answers 401. Huma prefixes the server URL, which already ends in `/api/v1`.
+- `$schema` links, fixed 2026-11-03 after this phase (source checked against Huma v2.40.0 `transforms.go`). Huma's default `SchemaLinkTransformer` built the URL from the request.
+  - Faults:
+    - A `Host` starting with `localhost` made it use `Servers[0].URL`, which already ends in `/api/v1`, so links read `/api/v1/api/v1/schemas/...` and answered 401. Integration tests never saw this because they request `127.0.0.1`.
+    - Any plain-HTTP host other than localhost or 127.0.0.1 got `https://`.
+    - `X-Forwarded-Host` and `Forwarded` were believed from any peer.
+  - Fix: `server.withCanonicalSchemaLinks` adds a create hook whose transformer runs after Huma's and rewrites only the URL to `BASE_URL + /api/v1/schemas/<Name>.json`. That is the example the spec already shows, and it matches how `short_url` is built. Huma's transformer still adds the property to the spec, the wrapper type and the `Link: rel="describedBy"` header, which was always correct because it is relative. The Huma docs name managing the `Transformers` and `OnAddOperation` hooks as the way to customise this. v2.40.0 is the latest release, and a web search found no upstream issue for this.
+  - Tests: `TestSchemaLinksUseBaseURL` covers localhost, LAN, loopback and spoofed-header requests for both success and error bodies, and follows each link without credentials. It fails on all six cases without the hook. `TestSchemaLinkResolves` (integration) does the same through `app.New` against Postgres. Checked by hand against the binary: the link answers 200 and the old doubled URL still answers 401.
 
 ## Decisions (locked 2026-11-02)
 

@@ -34,6 +34,33 @@ func TestDocsArePublic(t *testing.T) {
 	e.expectStatus(e.do(http.MethodGet, "/api/v1/docs", "", nil), http.StatusOK, "GET /api/v1/docs")
 }
 
+// TestSchemaLinkResolves follows the `$schema` link of a real response. It
+// is built from BASE_URL, so a localhost Host header (which used to double
+// the /api/v1 prefix) no longer changes it, and it needs no credentials.
+func TestSchemaLinkResolves(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	key := e.newKey("schema-link")
+
+	r := e.do(http.MethodPost, "/api/v1/links", key, createRequest{URL: target})
+	e.expectStatus(r, http.StatusCreated, "POST /api/v1/links")
+	var created linkBody
+	e.decode(r, &created)
+
+	req := e.request(http.MethodGet, "/api/v1/links/"+created.Code, key)
+	req.Host = "localhost"
+	r = e.send(req)
+	e.expectStatus(r, http.StatusOK, "GET /api/v1/links/{code} with Host: localhost")
+	var body struct {
+		Schema string `json:"$schema"`
+	}
+	e.decode(r, &body)
+	if want := e.base + "/api/v1/schemas/LinkBody.json"; body.Schema != want {
+		t.Errorf("$schema = %q, want %q", body.Schema, want)
+	}
+	e.expectStatus(e.do(http.MethodGet, body.Schema, "", nil), http.StatusOK, "GET $schema")
+}
+
 func TestLinkLifecycle(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
