@@ -44,7 +44,8 @@ func (s *Server) routes() http.Handler {
 			api.Use(chimw.Maybe(mw, protected))
 		}
 
-		apiURL := s.cfg.BaseURL + APIBasePath
+		// BASE_URL may end in "/"; "//api/v1" would not route.
+		apiURL := strings.TrimRight(s.cfg.BaseURL, "/") + APIBasePath
 		cfg.Servers = []*huma.Server{{URL: apiURL}}
 		cfg = withCanonicalSchemaLinks(cfg, apiURL+cfg.SchemasPath+"/")
 		if cfg.Components == nil {

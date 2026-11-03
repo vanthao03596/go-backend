@@ -167,6 +167,8 @@ func TestSchemaLinksUseBaseURL(t *testing.T) {
 		{name: "loopback host", base: "https://sho.rt", host: "127.0.0.1:8080"},
 		{name: "spoofed X-Forwarded-Host", base: "https://sho.rt", host: "sho.rt", header: http.Header{"X-Forwarded-Host": {"evil.example"}}},
 		{name: "spoofed Forwarded", base: "https://sho.rt", host: "sho.rt", header: http.Header{"Forwarded": {"host=evil.example"}}},
+		// Config accepts a trailing slash; the link must not get "//api/v1".
+		{name: "base with trailing slash", base: "https://sho.rt/", host: "sho.rt"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -186,7 +188,7 @@ func TestSchemaLinksUseBaseURL(t *testing.T) {
 				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 					t.Fatalf("GET %s: decode %q: %v", path, rec.Body.String(), err)
 				}
-				want := tc.base + APIBasePath + "/schemas/" + schema + ".json"
+				want := strings.TrimRight(tc.base, "/") + APIBasePath + "/schemas/" + schema + ".json"
 				if body.Schema != want {
 					t.Errorf("GET %s: $schema = %q, want %q", path, body.Schema, want)
 				}
