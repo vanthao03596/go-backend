@@ -32,6 +32,18 @@ type Config struct {
 	TrustedProxies []string `env:"TRUSTED_PROXIES" envSeparator:","`
 	RateLimit      RateLimitConfig
 	Clicks         ClickConfig
+	Telemetry      TelemetryConfig
+}
+
+// TelemetryConfig switches OpenTelemetry export on. Everything else (OTLP
+// endpoint, headers, sampler, resource attributes, export intervals) is read
+// by the OpenTelemetry SDK itself from the standard OTEL_* variables, so it
+// is deliberately not duplicated here.
+type TelemetryConfig struct {
+	// Enabled exports traces and metrics over OTLP gRPC. Off by default so a
+	// process without a collector neither dials one nor logs export errors.
+	// The Go SDK does not implement OTEL_SDK_DISABLED, hence an app flag.
+	Enabled bool `env:"TELEMETRY_ENABLED" envDefault:"false"`
 }
 
 // ClickConfig tunes click analytics: the in-process buffer that takes click

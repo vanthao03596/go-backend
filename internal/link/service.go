@@ -10,6 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -21,6 +25,17 @@ const (
 	MaxPageSize int32 = 100
 )
 
+// instrumentationName is the OpenTelemetry scope for link metrics.
+const instrumentationName = "github.com/vanthao03596/go-backend/internal/link"
+
+// Metric attribute for link creations: whether the caller chose the code.
+const attrCustomAlias = attribute.Key("shortener.link.custom_alias")
+
+var (
+	createdWithAlias = metric.WithAttributeSet(attribute.NewSet(attrCustomAlias.Bool(true)))
+	createdGenerated = metric.WithAttributeSet(attribute.NewSet(attrCustomAlias.Bool(false)))
+)
+
 // Service holds the business rules. It knows nothing about HTTP or SQL.
 type Service struct {
 	repo    Repository
@@ -28,6 +43,11 @@ type Service struct {
 	baseURL string
 	log     *slog.Logger
 	now     func() time.Time
+
+	meterProvider metric.MeterProvider
+	meter         metric.Meter
+	created       metric.Int64Counter
+	collisions    metric.Int64Counter
 }
 
 // ServiceOption customises a Service at construction time.
@@ -45,6 +65,12 @@ func WithClickSink(sink ClickSink) ServiceOption {
 	return func(s *Service) { s.clicks = sink }
 }
 
+// WithMeterProvider sets where the service and its Handler report metrics.
+// Without it the otel global is used, a no-op until telemetry is set up.
+func WithMeterProvider(mp metric.MeterProvider) ServiceOption {
+	return func(s *Service) { s.meterProvider = mp }
+}
+
 // NewService wires a Service. baseURL is the public origin used to build short URLs.
 func NewService(repo Repository, baseURL string, log *slog.Logger, opts ...ServiceOption) *Service {
 	s := &Service{
@@ -56,6 +82,23 @@ func NewService(repo Repository, baseURL string, log *slog.Logger, opts ...Servi
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.meterProvider == nil {
+		s.meterProvider = otel.GetMeterProvider()
+	}
+	s.meter = s.meterProvider.Meter(instrumentationName)
+
+	var errs [2]error
+	s.created, errs[0] = s.meter.Int64Counter("shortener.links.created",
+		metric.WithDescription("Links created, by whether the caller chose the code."),
+		metric.WithUnit("{link}"))
+	s.collisions, errs[1] = s.meter.Int64Counter("shortener.links.code_collisions",
+		metric.WithDescription("Generated codes that collided with an existing code and were regenerated."),
+		metric.WithUnit("{collision}"))
+	// The SDK returns a working instrument alongside a registration error,
+	// so report it and carry on rather than fail construction.
+	if err := errors.Join(errs[:]...); err != nil {
+		otel.Handle(err)
 	}
 	return s
 }
@@ -78,7 +121,12 @@ func (s *Service) Create(ctx context.Context, apiKeyID int64, p CreateParams) (L
 		if err := ValidateAlias(p.Alias); err != nil {
 			return Link{}, err
 		}
-		return s.repo.Insert(ctx, p.Alias, p.URL, apiKeyID, p.ExpiresAt)
+		l, err := s.repo.Insert(ctx, p.Alias, p.URL, apiKeyID, p.ExpiresAt)
+		if err != nil {
+			return Link{}, err
+		}
+		s.created.Add(ctx, 1, createdWithAlias)
+		return l, nil
 	}
 
 	for attempt := 1; attempt <= maxCodeAttempts; attempt++ {
@@ -88,11 +136,13 @@ func (s *Service) Create(ctx context.Context, apiKeyID int64, p CreateParams) (L
 		}
 		l, err := s.repo.Insert(ctx, code, p.URL, apiKeyID, p.ExpiresAt)
 		if err == nil {
+			s.created.Add(ctx, 1, createdGenerated)
 			return l, nil
 		}
 		if !errors.Is(err, ErrCodeTaken) {
 			return Link{}, err
 		}
+		s.collisions.Add(ctx, 1)
 		s.log.WarnContext(ctx, "generated code collided", "attempt", attempt, "code", code)
 	}
 	return Link{}, fmt.Errorf("gave up after %d code collisions", maxCodeAttempts)

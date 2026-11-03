@@ -7,11 +7,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/vanthao03596/go-backend/internal/config"
 )
@@ -52,6 +58,9 @@ type Server struct {
 	workers       []namedWorker
 	hooks         []namedHook
 
+	tracerProvider trace.TracerProvider
+	meterProvider  metric.MeterProvider
+
 	// Set by Run; nil when the server was only used through Handler.
 	stopWorkers context.CancelFunc
 	workersDone chan struct{}
@@ -88,6 +97,15 @@ func WithShutdownHook(name string, h ShutdownHook) Option {
 	return func(s *Server) { s.hooks = append(s.hooks, namedHook{name: name, run: h}) }
 }
 
+// WithTelemetry sets where request spans and HTTP metrics go. Without it the
+// otel globals are used, which are no-ops until telemetry is set up.
+func WithTelemetry(tp trace.TracerProvider, mp metric.MeterProvider) Option {
+	return func(s *Server) {
+		s.tracerProvider = tp
+		s.meterProvider = mp
+	}
+}
+
 // New builds a Server. It does not start listening.
 func New(cfg config.Config, log *slog.Logger, opts ...Option) *Server {
 	s := &Server{
@@ -98,9 +116,15 @@ func New(cfg config.Config, log *slog.Logger, opts ...Option) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.tracerProvider == nil {
+		s.tracerProvider = otel.GetTracerProvider()
+	}
+	if s.meterProvider == nil {
+		s.meterProvider = otel.GetMeterProvider()
+	}
 	s.http = &http.Server{
 		Addr:              cfg.Addr(),
-		Handler:           s.routes(),
+		Handler:           s.instrument(s.routes()),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      cfg.RequestTimeout + 5*time.Second,
@@ -109,6 +133,57 @@ func New(cfg config.Config, log *slog.Logger, opts ...Option) *Server {
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	return s
+}
+
+// instrument wraps the router with otelhttp, which opens the server span and
+// records the semantic-convention HTTP metrics (request duration and body
+// sizes). Health probes are neither traced nor measured: they are frequent
+// and would drown the traffic worth looking at.
+//
+// Incoming W3C trace context is only continued when the TCP peer is one of
+// TRUSTED_PROXIES. Every other request starts a new trace that links to the
+// caller's, so an internet client can neither force its requests to be
+// sampled nor graft spans onto someone else's trace. Only the traceparent
+// and tracestate headers are read: the service has no use for W3C baggage,
+// and extracting it would put caller-controlled key-values into every
+// request context whatever the peer.
+func (s *Server) instrument(h http.Handler) http.Handler {
+	trusted := make([]netip.Prefix, 0, len(s.cfg.TrustedProxies))
+	for _, cidr := range s.cfg.TrustedProxies {
+		// Config validation already rejected malformed entries.
+		if p, err := netip.ParsePrefix(cidr); err == nil {
+			trusted = append(trusted, p)
+		}
+	}
+	return otelhttp.NewHandler(h, "http.server",
+		otelhttp.WithTracerProvider(s.tracerProvider),
+		otelhttp.WithMeterProvider(s.meterProvider),
+		otelhttp.WithPropagators(propagation.TraceContext{}),
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			return r.URL.Path != "/healthz" && r.URL.Path != "/readyz"
+		}),
+		otelhttp.WithPublicEndpointFn(func(r *http.Request) bool {
+			return !peerIn(r.RemoteAddr, trusted)
+		}),
+	)
+}
+
+// peerIn reports whether the host part of remoteAddr lies in one of prefixes.
+func peerIn(remoteAddr string, prefixes []netip.Prefix) bool {
+	if len(prefixes) == 0 {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	addr := ap.Addr().Unmap()
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // Handler exposes the root handler, mainly for httptest.

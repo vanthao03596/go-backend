@@ -11,6 +11,10 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 
 	"github.com/vanthao03596/go-backend/internal/apikey"
 	"github.com/vanthao03596/go-backend/internal/server"
@@ -26,6 +30,7 @@ type Handler struct {
 	svc           *Service
 	log           *slog.Logger
 	redirectLimit Middleware
+	redirects     metric.Int64Counter
 }
 
 // HandlerOption customises a Handler.
@@ -37,13 +42,40 @@ func WithRedirectRateLimit(mw Middleware) HandlerOption {
 	return func(h *Handler) { h.redirectLimit = mw }
 }
 
-// NewHandler builds a Handler around svc.
+// NewHandler builds a Handler around svc. It reports metrics to the
+// service's meter provider.
 func NewHandler(svc *Service, log *slog.Logger, opts ...HandlerOption) *Handler {
 	h := &Handler{svc: svc, log: log}
 	for _, opt := range opts {
 		opt(h)
 	}
+	var err error
+	h.redirects, err = svc.meter.Int64Counter("shortener.redirects",
+		metric.WithDescription("Short-link requests answered by the redirect handler, by HTTP status."),
+		metric.WithUnit("{request}"))
+	if err != nil {
+		otel.Handle(err)
+	}
 	return h
+}
+
+// redirectStatusAttrs holds one attribute set per status the redirect handler
+// answers with, built once so counting a redirect does not allocate.
+var redirectStatusAttrs = func() map[int]metric.AddOption {
+	m := map[int]metric.AddOption{}
+	for _, code := range []int{http.StatusFound, http.StatusNotFound, http.StatusGone, http.StatusInternalServerError} {
+		m[code] = metric.WithAttributeSet(attribute.NewSet(semconv.HTTPResponseStatusCode(code)))
+	}
+	return m
+}()
+
+func (h *Handler) countRedirect(ctx context.Context, status int) {
+	opt, ok := redirectStatusAttrs[status]
+	if !ok {
+		// A status without a prebuilt set still counts; it just allocates.
+		opt = metric.WithAttributes(semconv.HTTPResponseStatusCode(status))
+	}
+	h.redirects.Add(ctx, 1, opt)
 }
 
 // CreateRateLimit restricts mw to the create-link request so the rest of the
@@ -226,14 +258,18 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 	target, err := h.svc.Resolve(r.Context(), code, visit)
 	switch {
 	case err == nil:
+		h.countRedirect(r.Context(), http.StatusFound)
 		// Redirecting to a caller-supplied URL is the product. The target was
 		// validated by ValidateTargetURL when the link was created.
 		http.Redirect(w, r, target, http.StatusFound) //nolint:gosec // G710 open redirect is intentional
 	case errors.Is(err, ErrNotFound):
+		h.countRedirect(r.Context(), http.StatusNotFound)
 		http.Error(w, "short link not found", http.StatusNotFound)
 	case errors.Is(err, ErrGone):
+		h.countRedirect(r.Context(), http.StatusGone)
 		http.Error(w, "short link expired or deleted", http.StatusGone)
 	default:
+		h.countRedirect(r.Context(), http.StatusInternalServerError)
 		h.log.ErrorContext(r.Context(), "resolve link",
 			"request_id", middleware.RequestIDFrom(r.Context()), "code", code, "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)

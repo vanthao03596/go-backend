@@ -22,6 +22,8 @@ const SecuritySchemeName = "bearerAuth"
 func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
 
+	// First, so it runs last on the way out, once routing has completed.
+	r.Use(middleware.TraceRoute)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.ClientIP(s.cfg.TrustedProxies))
 	r.Use(middleware.Recover(s.log))

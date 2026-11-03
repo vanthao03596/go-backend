@@ -6,6 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -21,9 +26,11 @@ const (
 
 // Service answers statistics and runs retention. It has no HTTP or SQL.
 type Service struct {
-	repo Repository
-	log  *slog.Logger
-	now  func() time.Time
+	repo           Repository
+	log            *slog.Logger
+	now            func() time.Time
+	tracerProvider trace.TracerProvider
+	tracer         trace.Tracer
 }
 
 // ServiceOption customises a Service at construction time.
@@ -35,12 +42,22 @@ func WithNow(now func() time.Time) ServiceOption {
 	return func(s *Service) { s.now = now }
 }
 
+// WithTracerProvider sets where the purger's spans go. Without it the otel
+// global is used, a no-op until telemetry is set up.
+func WithTracerProvider(tp trace.TracerProvider) ServiceOption {
+	return func(s *Service) { s.tracerProvider = tp }
+}
+
 // NewService wires a Service.
 func NewService(repo Repository, log *slog.Logger, opts ...ServiceOption) *Service {
 	s := &Service{repo: repo, log: log, now: time.Now}
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.tracerProvider == nil {
+		s.tracerProvider = otel.GetTracerProvider()
+	}
+	s.tracer = s.tracerProvider.Tracer(instrumentationName)
 	return s
 }
 
@@ -118,15 +135,24 @@ func (s *Service) RunPurger(ctx context.Context, retention, interval time.Durati
 	}
 }
 
+// purgeOnce runs one scheduled purge under a root span, which parents the
+// batched DELETE spans.
 func (s *Service) purgeOnce(ctx context.Context, retention time.Duration) {
+	ctx, span := s.tracer.Start(ctx, "click.purge", trace.WithNewRoot(),
+		trace.WithAttributes(attribute.String("shortener.clicks.retention", retention.String())))
+	defer span.End()
+
 	start := s.now()
 	n, err := s.Purge(ctx, retention)
+	span.SetAttributes(attribute.Int64("shortener.clicks.purged", n))
 	switch {
 	case err == nil:
 		s.log.InfoContext(ctx, "clicks purged", "deleted", n, "retention", retention, "duration", s.now().Sub(start))
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		s.log.InfoContext(ctx, "click purge interrupted", "deleted", n, "err", err)
 	default:
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "purge clicks failed")
 		s.log.ErrorContext(ctx, "click purge failed", "deleted", n, "err", err)
 	}
 }

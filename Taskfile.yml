@@ -5,6 +5,10 @@ dotenv: ['.env']
 vars:
   BIN: bin/api
   PKG: ./cmd/api
+  COMPOSE: docker compose -f deploy/docker-compose.yml
+  # Reported as service.version in telemetry.
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
 
 tasks:
   default:
@@ -22,7 +26,7 @@ tasks:
     sources: ['**/*.go', go.mod, go.sum]
     generates: ['{{.BIN}}']
     cmds:
-      - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o {{.BIN}} {{.PKG}}
+      - CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version={{.VERSION}}" -o {{.BIN}} {{.PKG}}
 
   test:
     desc: Run unit tests with the race detector
@@ -51,7 +55,7 @@ tasks:
   image:build:
     desc: Build the container image
     cmds:
-      - docker build -t shortener:local .
+      - docker build --build-arg VERSION={{.VERSION}} -t shortener:local .
 
   image:run:
     desc: Run the image against the compose Postgres on port 8080
@@ -85,12 +89,22 @@ tasks:
   up:
     desc: Start local Postgres
     cmds:
-      - docker compose -f deploy/docker-compose.yml up -d --wait
+      - '{{.COMPOSE}} up -d --wait'
 
   down:
-    desc: Stop local Postgres and remove volumes
+    desc: Stop everything in the compose project (Postgres and the observability stack) and remove volumes
     cmds:
-      - docker compose -f deploy/docker-compose.yml down -v
+      - '{{.COMPOSE}} --profile observability down -v'
+
+  otel:up:
+    desc: "Start Postgres plus the OTel collector, Jaeger (http://localhost:16686) and Prometheus (http://localhost:9090). Set TELEMETRY_ENABLED=true in .env to export."
+    cmds:
+      - '{{.COMPOSE}} --profile observability up -d --wait'
+
+  otel:down:
+    desc: Stop the observability stack, leaving Postgres running
+    cmds:
+      - '{{.COMPOSE}} --profile observability rm --stop --force otel-collector jaeger prometheus'
 
   apikey:create:
     desc: "Issue an API key and print it once. Usage: task apikey:create -- <name>"

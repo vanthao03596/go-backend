@@ -13,6 +13,7 @@ func clearEnv(t *testing.T) {
 		"DATABASE_URL", "MIGRATE_ON_START", "DB_MAX_CONNS", "DB_MIN_CONNS",
 		"DB_MAX_CONN_LIFETIME", "DB_MAX_CONN_IDLE_TIME", "DB_CONNECT_TIMEOUT",
 		"TRUSTED_PROXIES", "RATE_LIMIT_CREATE_PER_SEC", "RATE_LIMIT_REDIRECT_PER_SEC",
+		"TELEMETRY_ENABLED",
 	} {
 		t.Setenv(k, "")
 	}
@@ -40,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.DB.MaxConns != 10 || cfg.DB.MinConns != 2 {
 		t.Errorf("DB pool defaults = %d/%d, want 10/2", cfg.DB.MaxConns, cfg.DB.MinConns)
+	}
+	if cfg.Telemetry.Enabled {
+		t.Error("Telemetry.Enabled should default to false")
 	}
 }
 

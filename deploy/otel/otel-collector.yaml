@@ -1,0 +1,49 @@
+# Local OpenTelemetry Collector: receives OTLP from the API on the host and
+# fans out traces to Jaeger and metrics to a Prometheus scrape endpoint.
+# Checked against otel/opentelemetry-collector 0.164.0.
+receivers:
+  otlp:
+    protocols:
+      # Servers bind localhost by default since 0.110.0, which a published
+      # container port cannot reach.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # First in every pipeline.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+exporters:
+  # "otlp_grpc" since 0.144.0; plain "otlp" is a deprecated alias. Batching
+  # lives in the exporter's queue: the batch processor is being retired.
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    sending_queue:
+      batch: {}
+  # service.name becomes the job label and service.instance.id the instance
+  # label; these two resource attributes are copied onto every series too.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_constant_labels:
+      included: [service.version, deployment.environment.name]
+  # One summary line per batch in `docker compose logs otel-collector`.
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [otlp_grpc/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [prometheus, debug]

@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // PoolOptions tunes the pgx pool beyond what the connection string provides.
@@ -16,6 +20,12 @@ type PoolOptions struct {
 	MaxConnLifetime time.Duration
 	MaxConnIdleTime time.Duration
 	ConnectTimeout  time.Duration
+
+	// TracerProvider and MeterProvider receive query spans, query duration
+	// metrics and pool statistics. Nil uses the otel globals, which are
+	// no-ops until telemetry is set up.
+	TracerProvider trace.TracerProvider
+	MeterProvider  metric.MeterProvider
 }
 
 // NewPool parses the connection string, applies opts and verifies connectivity
@@ -42,9 +52,29 @@ func NewPool(ctx context.Context, connString string, opts PoolOptions) (*pgxpool
 		cfg.ConnConfig.ConnectTimeout = opts.ConnectTimeout
 	}
 
+	tp, mp := opts.TracerProvider, opts.MeterProvider
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	// otelpgx only opens a span when the context already carries a recording
+	// one, so queries outside a request or a traced background job produce
+	// nothing. Parameters are never recorded: they hold target URLs and user
+	// agents. Statements are, and they only contain placeholders.
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer(
+		otelpgx.WithTracerProvider(tp),
+		otelpgx.WithMeterProvider(mp),
+	)
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
+	}
+	if err := otelpgx.RecordStats(pool, otelpgx.WithStatsMeterProvider(mp)); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("record pool stats: %w", err)
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/vanthao03596/go-backend/internal/apikey"
 	"github.com/vanthao03596/go-backend/internal/click"
@@ -23,7 +26,9 @@ import (
 type Option func(*options)
 
 type options struct {
-	now func() time.Time
+	now            func() time.Time
+	tracerProvider trace.TracerProvider
+	meterProvider  metric.MeterProvider
 }
 
 // WithClock replaces the clock used for link expiry, click timestamps and the
@@ -31,6 +36,17 @@ type options struct {
 // forward instead of sleeping.
 func WithClock(now func() time.Time) Option {
 	return func(o *options) { o.now = now }
+}
+
+// WithTelemetry sets the providers every component reports spans and metrics
+// to. Without it the otel globals are used, which are no-ops unless
+// telemetry was set up. The database pool is instrumented separately, by
+// db.NewPool.
+func WithTelemetry(tp trace.TracerProvider, mp metric.MeterProvider) Option {
+	return func(o *options) {
+		o.tracerProvider = tp
+		o.meterProvider = mp
+	}
 }
 
 // New wires every feature onto a server using pool for persistence. The
@@ -41,19 +57,27 @@ func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, opts ...Option
 	for _, opt := range opts {
 		opt(&o)
 	}
+	if o.tracerProvider == nil {
+		o.tracerProvider = otel.GetTracerProvider()
+	}
+	if o.meterProvider == nil {
+		o.meterProvider = otel.GetMeterProvider()
+	}
 
 	queries := sqlc.New(pool)
 	keySvc := apikey.NewService(apikey.NewRepository(queries))
 
 	clickRepo := click.NewRepository(pool, queries)
 	clickBuf := click.NewBuffer(clickRepo, log, click.BufferConfig{
-		Size:          cfg.Clicks.BufferSize,
-		FlushInterval: cfg.Clicks.FlushInterval,
-		MaxBatch:      cfg.Clicks.FlushBatch,
+		Size:           cfg.Clicks.BufferSize,
+		FlushInterval:  cfg.Clicks.FlushInterval,
+		MaxBatch:       cfg.Clicks.FlushBatch,
+		TracerProvider: o.tracerProvider,
+		MeterProvider:  o.meterProvider,
 	})
 
-	var linkOpts []link.ServiceOption
-	var clickOpts []click.ServiceOption
+	linkOpts := []link.ServiceOption{link.WithMeterProvider(o.meterProvider)}
+	clickOpts := []click.ServiceOption{click.WithTracerProvider(o.tracerProvider)}
 	if o.now != nil {
 		linkOpts = append(linkOpts, link.WithNow(o.now))
 		clickOpts = append(clickOpts, click.WithNow(o.now))
@@ -67,6 +91,7 @@ func New(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, opts ...Option
 	clickHandler := click.NewHandler(clickSvc, linkSvc, log)
 
 	srvOpts := []server.Option{
+		server.WithTelemetry(o.tracerProvider, o.meterProvider),
 		server.WithReadiness("postgres", pool.Ping),
 		server.WithFeature(linkHandler.Register),
 		server.WithFeature(clickHandler.Register),

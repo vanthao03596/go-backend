@@ -2,6 +2,7 @@ package click
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -10,6 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/vanthao03596/go-backend/internal/link"
 )
@@ -26,6 +33,12 @@ type BufferConfig struct {
 	MaxBatch int
 	// FlushTimeout bounds one Store call.
 	FlushTimeout time.Duration
+
+	// TracerProvider receives one span per flush, which parents the
+	// flush's database spans. MeterProvider receives the flush and drop
+	// metrics. Nil uses the otel globals.
+	TracerProvider trace.TracerProvider
+	MeterProvider  metric.MeterProvider
 }
 
 // Defaults for BufferConfig.
@@ -54,8 +67,35 @@ func (c BufferConfig) withDefaults() BufferConfig {
 	if c.FlushTimeout <= 0 {
 		c.FlushTimeout = DefaultFlushTimeout
 	}
+	if c.TracerProvider == nil {
+		c.TracerProvider = otel.GetTracerProvider()
+	}
+	if c.MeterProvider == nil {
+		c.MeterProvider = otel.GetMeterProvider()
+	}
 	return c
 }
+
+// Telemetry attribute keys and values for the buffer's metrics.
+const (
+	attrFlushOutcome = attribute.Key("shortener.clicks.flush.outcome")
+	attrDropReason   = attribute.Key("shortener.clicks.drop_reason")
+)
+
+var (
+	flushStored  = metric.WithAttributeSet(attribute.NewSet(attrFlushOutcome.String("stored")))
+	flushRetry   = metric.WithAttributeSet(attribute.NewSet(attrFlushOutcome.String("retry")))
+	flushDropped = metric.WithAttributeSet(attribute.NewSet(attrFlushOutcome.String("dropped")))
+
+	// buffer_full: the enqueue channel was full (traffic outran the flusher).
+	// retry_backlog_full: a failed batch is held for retry and has grown to
+	// Size, so the database is the problem. flush_failed: a batch was given
+	// up after maxFlushAttempts. closed: recorded after Close.
+	dropBufferFull       = metric.WithAttributeSet(attribute.NewSet(attrDropReason.String("buffer_full")))
+	dropRetryBacklogFull = metric.WithAttributeSet(attribute.NewSet(attrDropReason.String("retry_backlog_full")))
+	dropClosed           = metric.WithAttributeSet(attribute.NewSet(attrDropReason.String("closed")))
+	dropFlushFailed      = metric.WithAttributeSet(attribute.NewSet(attrDropReason.String("flush_failed")))
+)
 
 // Buffer implements link.ClickSink with a bounded channel drained by one
 // flusher goroutine. Record never blocks; Close drains what is pending.
@@ -84,6 +124,10 @@ type Buffer struct {
 	startOnce sync.Once
 	started   atomic.Bool
 	dropped   atomic.Int64 // since the last flush log line
+
+	tracer    trace.Tracer
+	flushSize metric.Int64Histogram
+	dropCount metric.Int64Counter
 }
 
 var _ link.ClickSink = (*Buffer)(nil)
@@ -93,14 +137,33 @@ var _ link.ClickSink = (*Buffer)(nil)
 // nothing. Call Close to flush and stop it.
 func NewBuffer(repo Repository, log *slog.Logger, cfg BufferConfig) *Buffer {
 	cfg = cfg.withDefaults()
-	return &Buffer{
-		repo: repo,
-		log:  log,
-		cfg:  cfg,
-		ch:   make(chan link.Click, cfg.Size),
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+	b := &Buffer{
+		repo:   repo,
+		log:    log,
+		cfg:    cfg,
+		ch:     make(chan link.Click, cfg.Size),
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+		tracer: cfg.TracerProvider.Tracer(instrumentationName),
 	}
+	meter := cfg.MeterProvider.Meter(instrumentationName)
+	var errs [2]error
+	b.flushSize, errs[0] = meter.Int64Histogram("shortener.clicks.flush.size",
+		metric.WithDescription("Clicks per flush attempt, by outcome: stored, retry (kept for the next tick) or dropped (gave up)."),
+		metric.WithUnit("{click}"))
+	b.dropCount, errs[1] = meter.Int64Counter("shortener.clicks.dropped",
+		metric.WithDescription("Clicks discarded before reaching the database, by reason."),
+		metric.WithUnit("{click}"))
+	if err := errors.Join(errs[:]...); err != nil {
+		otel.Handle(err)
+	}
+	return b
+}
+
+// drop counts one discarded click for the flush log line and the metric.
+func (b *Buffer) drop(reason metric.AddOption) {
+	b.dropped.Add(1)
+	b.dropCount.Add(context.Background(), 1, reason)
 }
 
 // Record implements link.ClickSink. It sanitises the header values and
@@ -112,7 +175,7 @@ func (b *Buffer) Record(c link.Click) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
-		b.dropped.Add(1)
+		b.drop(dropClosed)
 		return
 	}
 	b.startOnce.Do(func() {
@@ -122,7 +185,7 @@ func (b *Buffer) Record(c link.Click) {
 	select {
 	case b.ch <- c:
 	default:
-		b.dropped.Add(1)
+		b.drop(dropBufferFull)
 	}
 }
 
@@ -152,7 +215,7 @@ func (b *Buffer) Close(ctx context.Context) error {
 }
 
 // Dropped reports clicks discarded since the last flush log line. It exists
-// for tests and metrics.
+// for tests; the shortener.clicks.dropped metric is the operational view.
 func (b *Buffer) Dropped() int64 { return b.dropped.Load() }
 
 func (b *Buffer) run() {
@@ -200,7 +263,7 @@ type flusher struct {
 func (f *flusher) add(c link.Click) {
 	if f.attempts > 0 {
 		if len(f.batch) >= f.b.cfg.Size {
-			f.b.dropped.Add(1)
+			f.b.drop(dropRetryBacklogFull)
 			return
 		}
 		f.batch = append(f.batch, c)
@@ -214,6 +277,10 @@ func (f *flusher) add(c link.Click) {
 
 // flush stores the batch. On failure the batch is kept for the next tick
 // until maxFlushAttempts, then dropped.
+//
+// Each attempt is a root span: flushes run off the request path and batch
+// clicks from many requests, so no single request trace could own them. The
+// span is what lets the database spans underneath be recorded at all.
 func (f *flusher) flush() {
 	b := f.b
 	if n := b.dropped.Swap(0); n > 0 {
@@ -222,17 +289,34 @@ func (f *flusher) flush() {
 	if len(f.batch) == 0 {
 		return
 	}
+	size := int64(len(f.batch))
 	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.FlushTimeout)
 	defer cancel()
+	ctx, span := b.tracer.Start(ctx, "click.flush",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.Int64("shortener.clicks.flush.size", size),
+			attribute.Int("shortener.clicks.flush.attempt", f.attempts+1),
+		))
+	defer span.End()
+
 	err := b.repo.Store(ctx, f.batch)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "store clicks failed")
+	}
 	switch {
 	case err == nil:
+		b.flushSize.Record(ctx, size, flushStored)
 	case f.attempts+1 < maxFlushAttempts:
 		f.attempts++
-		b.log.Warn("flush clicks failed, will retry", "count", len(f.batch), "attempt", f.attempts, "err", err)
+		b.flushSize.Record(ctx, size, flushRetry)
+		b.log.WarnContext(ctx, "flush clicks failed, will retry", "count", size, "attempt", f.attempts, "err", err)
 		return
 	default:
-		b.log.Error("flush clicks failed, dropping batch", "count", len(f.batch), "attempts", f.attempts+1, "err", err)
+		b.flushSize.Record(ctx, size, flushDropped)
+		b.dropCount.Add(ctx, size, dropFlushFailed)
+		b.log.ErrorContext(ctx, "flush clicks failed, dropping batch", "count", size, "attempts", f.attempts+1, "err", err)
 	}
 	f.attempts = 0
 	clear(f.batch)

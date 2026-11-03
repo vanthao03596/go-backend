@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/vanthao03596/go-backend/internal/apikey"
 	"github.com/vanthao03596/go-backend/internal/app"
 	"github.com/vanthao03596/go-backend/internal/config"
@@ -53,6 +55,12 @@ type env struct {
 // address and short URLs returned by the API are directly requestable.
 func newEnv(t *testing.T, mutate func(*config.Config)) *env {
 	t.Helper()
+	return newEnvWith(t, pool, mutate)
+}
+
+// newEnvWith is newEnv against a specific pool and with extra app options.
+func newEnvWith(t *testing.T, p *pgxpool.Pool, mutate func(*config.Config), opts ...app.Option) *env {
+	t.Helper()
 
 	ts := httptest.NewUnstartedServer(nil)
 	base := "http://" + ts.Listener.Addr().String()
@@ -81,7 +89,7 @@ func newEnv(t *testing.T, mutate func(*config.Config)) *env {
 	}
 
 	clk := &clock{}
-	srv := app.New(cfg, logger, pool, app.WithClock(clk.Now))
+	srv := app.New(cfg, logger, p, append([]app.Option{app.WithClock(clk.Now)}, opts...)...)
 	// Cleanups run last-in first-out: stop traffic, then drain the buffer.
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

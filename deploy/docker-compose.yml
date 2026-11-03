@@ -18,5 +18,54 @@ services:
       timeout: 3s
       retries: 10
 
+  # Observability stack, started with `task otel:up` (the "observability"
+  # profile), so `task up` stays Postgres only. Every port is bound to
+  # loopback. The API on the host exports to the collector at localhost:4317.
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.164.0
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      GOMEMLIMIT: 400MiB
+    volumes:
+      - ./otel/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"   # OTLP gRPC
+      - "127.0.0.1:4318:4318"   # OTLP HTTP
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    # No healthcheck: the image is built FROM scratch and has no shell or wget.
+
+  jaeger:
+    # All-in-one with in-memory storage: traces are lost on restart.
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.22.0
+    profiles: [observability]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16686:16686" # UI
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:13133/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [observability]
+    restart: unless-stopped
+    volumes:
+      - ./otel/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"   # UI and query API
+    depends_on:
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:

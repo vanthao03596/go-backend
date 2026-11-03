@@ -29,6 +29,10 @@ const postgresImage = "postgres:17-alpine"
 // API key; links are scoped to a key and codes are random, so nothing collides.
 var pool *pgxpool.Pool
 
+// dsn reaches the test database, for tests that need a pool of their own
+// (for example one instrumented with a test tracer provider).
+var dsn string
+
 // logger discards application logs so test output stays readable. Switch to a
 // text handler on stderr when debugging a failing test.
 var logger = slog.New(slog.DiscardHandler)
@@ -58,7 +62,7 @@ func run(m *testing.M) int {
 		return 1
 	}
 
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
+	dsn, err = ctr.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "postgres connection string:", err)
 		return 1

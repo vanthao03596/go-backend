@@ -14,6 +14,9 @@ import (
 	"github.com/vanthao03596/go-backend/internal/link"
 )
 
+// instrumentationName is the OpenTelemetry scope for click spans and metrics.
+const instrumentationName = "github.com/vanthao03596/go-backend/internal/click"
+
 // Storage limits. Longer values are truncated before they reach Postgres;
 // the table has matching CHECK constraints.
 const (

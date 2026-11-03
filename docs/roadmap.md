@@ -213,7 +213,7 @@ Status: complete. Notes from implementation (library docs checked against pgx v5
 
   All 302s were counted: 675191 redirects served by the new binary produced exactly 675191 `clicks` rows, with no drop or flush-error log lines, and the lifetime counter reconciled with the old binary's share.
 
-### Phase 6: Observability (half a day)
+### Phase 6: Observability (half a day) - DONE 2026-11-03
 
 Goal: traces and metrics for every request.
 
@@ -224,6 +224,61 @@ Goal: traces and metrics for every request.
 - `slogx` handler that injects `trace_id` into every log line.
 
 Done when: a redirect shows up as a trace with HTTP and DB spans in the local UI.
+
+Status: complete. Notes from implementation (docs and sources checked against otel-go v1.47.0, otelhttp v0.72.0, otelpgx v0.13.0, chi v5.5.0, Collector 0.164.0, Jaeger 2.22.0, Prometheus v3.15.1):
+
+- The package is `internal/platform/otelx`, not `platform/otel`. It is named like `slogx` so it can be imported next to `go.opentelemetry.io/otel` without an alias. `otelx.Setup` follows the official getting-started bootstrap. It builds tracer and meter providers with OTLP gRPC exporters, installs the W3C trace-context and baggage propagators and the globals, starts runtime metrics, and routes SDK errors (failed exports) to slog. The exporters dial lazily, so a missing collector never fails startup.
+- Resource attributes:
+  - `service.name` is `shortener`.
+  - `service.version` comes from `-X main.version`, which `task build`, `task image:build` and CI pass, or else from the build info.
+  - `service.instance.id` is a UUIDv7 per process, so replicas never share a metric series.
+  - `deployment.environment.name` is derived from `APP_ENV`.
+  - `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override all of these. Every other knob (endpoint, headers, sampler, export interval) is a standard `OTEL_*` variable read by the SDK and is not duplicated in `config`.
+- `TELEMETRY_ENABLED` (default false) is an app flag because the Go SDK does not implement `OTEL_SDK_DISABLED`. When it is off, every component gets no-op providers and no global state changes. The operator subcommands are never traced. Telemetry shuts down after the HTTP drain and the click-buffer flush, so the last flush is exported. Its budget is `min(SHUTDOWN_TIMEOUT, 5s)`, because `Server.Shutdown` can already use twice `SHUTDOWN_TIMEOUT`; with the 10s default the worst case is 25s, inside a 30s Kubernetes grace period. A failed final export is logged, not fatal.
+- Providers are passed explicitly. The entry points are `app.WithTelemetry`, `server.WithTelemetry`, `link.WithMeterProvider`, `click.BufferConfig.{Tracer,Meter}Provider`, `click.WithTracerProvider` and `db.PoolOptions.{Tracer,Meter}Provider`. Nil falls back to the otel globals. Tests inject in-memory providers from `internal/platform/otelx/otelxtest`.
+- HTTP: `otelhttp.NewHandler` wraps the chi router.
+  - otelhttp names the span and sets `http.route` from `Request.Pattern` after the handler returns. chi v5.5.0 sets `Pattern` only on its own copy of the request, so out of the box every span was named `GET` and `http.server.request.duration` had no route. `middleware.TraceRoute`, first on the chi router, fixes this from chi's route context. It renames the span `"{method} {pattern}"` and adds `http.route` to the span and, through otelhttp's `Labeler`, to the request metrics. Unmatched requests keep the method-only name, so they cannot inflate cardinality.
+  - `/healthz` and `/readyz` are not traced or measured.
+  - Incoming `traceparent` is honoured only when the TCP peer is in `TRUSTED_PROXIES`. Any other request starts a new trace linked to the caller's (`WithPublicEndpointFn`), so an internet client cannot force sampling or graft spans onto a trace. The server extracts trace context only, never W3C baggage, from any peer: `WithPublicEndpointFn` drops only the parent, and the service has no use for caller-controlled key-values. The global propagator still includes baggage for libraries that use it.
+- Database: an otelpgx tracer on `ConnConfig.Tracer` covers query, prepare, copy, connect and pool-acquire spans plus `db.client.operation.duration`, and `otelpgx.RecordStats` adds `pgxpool.*` gauges.
+  - Query parameters are not recorded, because they hold target URLs and user agents. Statements are recorded and contain only placeholders.
+  - otelpgx opens spans only under a recording parent. The click flusher therefore starts a root `click.flush` span per attempt (size, attempt, error status) and the scheduled purger a root `click.purge` span. Their logs carry the trace id too.
+  - The first use of a statement on a connection shows up as two spans with the same name; the inner one is pgx's automatic prepare. `CopyFrom` also prepares a `SELECT` to learn column types, and the copy span is named `copy_from "clicks"` (pgx quotes the identifier).
+- Logs: `slogx.New` wraps the handler so any record logged with a span in its context gets `trace_id` and `span_id`. This includes the request log line, because otelhttp runs outside the chi middleware stack.
+- Metrics (Prometheus names in brackets):
+  - `shortener.redirects` [`shortener_redirects_total`], by `http.response.status_code`. GET and HEAD, all of 302, 404, 410 and 500.
+  - `shortener.links.created`, by `shortener.link.custom_alias`.
+  - `shortener.links.code_collisions`.
+  - `shortener.clicks.flush.size`, a histogram by `shortener.clicks.flush.outcome` (stored, retry, dropped).
+  - `shortener.clicks.dropped`, by `shortener.clicks.drop_reason`. Drops were previously only logged. The reasons:
+    - `buffer_full`: traffic outran the flusher.
+    - `retry_backlog_full`: a failed batch held for retry reached `CLICK_BUFFER_SIZE`, so the database is the problem.
+    - `flush_failed`: a batch was given up after three attempts.
+    - `closed`: the click was recorded after shutdown began.
+  - Alongside: otelhttp's `http.server.request.duration` and body sizes by `http.route`, otelpgx's database and pool metrics, and Go runtime metrics.
+  - A counter shows no series until its first increment.
+- Local stack: `task otel:up` starts the compose profile `observability` next to Postgres, and `task otel:down` removes it. `task down` removes everything, volumes included. All ports are bound to loopback: 4317/4318 (OTLP), 16686 (Jaeger UI) and 9090 (Prometheus).
+  - The Collector is the core image; it has every component used here.
+  - Since Collector 0.144.0 the exporter is called `otlp_grpc` (`otlp` is a deprecated alias). The `batch` processor is being retired in favour of the exporter's `sending_queue` batching. Receivers must bind `0.0.0.0` explicitly.
+  - Jaeger 2.22 runs the all-in-one with in-memory storage and receives OTLP from the Collector. Its HTTP API is `/api/v3/...`; the old `/api/traces` returns 404.
+  - Prometheus scrapes the Collector's prometheus exporter with `honor_labels`, so `job` is the service name.
+- Tests:
+  - Unit tests cover route naming for chi and Huma routes, the route label on request metrics, the health-probe filter, trace-context trust by peer, the link and click metrics and spans (the buffer under `testing/synctest`), the slog trace handler, resource precedence, and `Setup` without a reachable collector.
+  - `TestRedirectIsTraced` (integration) asserts against real Postgres that a redirect yields `GET /{code}` with a `SELECT` below it in the same trace, that the click arrives through a `click.flush` trace with `copy_from "clicks"`, and that the metrics were recorded.
+- Verified 2026-11-03 on the Linux workstation:
+  - With `task otel:up` and `TELEMETRY_ENABLED=true`, a redirect appears in Jaeger as `GET /{code}` (302, `http.route=/{code}`) with `pool.acquire` and `SELECT` children. Its `trace_id` matches the request log line.
+  - `click.flush` traces show BEGIN, `copy_from "clicks"`, UPDATE and COMMIT.
+  - Prometheus has `shortener_redirects_total{http_response_status_code="302"}`, `http_server_request_duration_seconds` by `http_route`, `db_client_operation_duration_seconds`, `pgxpool_*` and `go_*`.
+- Cost of tracing on the hot path. Measured with `hey -z 10s -c 50` on one hot code, same binary, redirect rate limit lifted, and the Collector and Jaeger on the same machine:
+
+  | Telemetry | Requests/s | p50 | p90 | p99 |
+  |---|---|---|---|---|
+  | Off | 37.6k | 1.2 ms | 1.8 ms | 2.6 ms |
+  | On, every trace sampled (SDK default) | 20.1k | 2.0 ms | 3.9 ms | 8.6 ms |
+  | On, `OTEL_TRACES_SAMPLER=parentbased_traceidratio`, `OTEL_TRACES_SAMPLER_ARG=0.01` | 42.6k | 1.1 ms | 1.7 ms | 2.5 ms |
+
+  Instrumenting is effectively free; exporting every trace is what costs. Production should set a ratio sampler. Metrics are unaffected by sampling.
+- The stripped binary grew from 13.7 MB to 24.3 MB, mostly gRPC and protobuf from the OTLP gRPC exporters. The OTLP/HTTP exporters would avoid gRPC if image size starts to matter.
 
 ### Phase 7: Cache and hardening (optional, 1 day)
 

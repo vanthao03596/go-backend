@@ -15,10 +15,13 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+# Reported as service.version. The build context has no .git, so the binary
+# cannot stamp a VCS revision itself; pass a tag or commit sha.
+ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/api ./cmd/api
 
 # Runtime stage. static-debian13 ships only ca-certificates, tzdata and a
 # passwd file; :nonroot runs as uid 65532 with HOME=/home/nonroot. There is no

@@ -32,8 +32,11 @@ generic methods, goroutine leak profiles, `httptest.NewTestServer` for `testing/
 | Config | `github.com/caarlos0/env/v11` | v11.4.1 | 2026-05-01 | Env vars into a typed struct. Preferred over `kelseyhightower/envconfig` (v1.4.0, unmaintained since 2019). |
 | Logging | `log/slog` | stdlib | - | JSON handler in production. Skip zap and logrus. |
 | Tracing and metrics | `go.opentelemetry.io/otel` | v1.47.0 | 2026-10-02 | Pin `otel`, `otel/sdk` and exporters to the same version. |
-| OTLP exporter | `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc` | v1.47.0 | 2026-10-02 | |
-| HTTP instrumentation | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.72.0 | 2026-10-02 | Contrib modules version separately from the core SDK. |
+| OTLP exporters | `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc`, `.../otlpmetric/otlpmetricgrpc` | v1.47.0 | 2026-10-02 | Configured by the standard `OTEL_EXPORTER_OTLP_*` variables. Default endpoint is `https://localhost:4317`. The Go SDK does not implement `OTEL_SDK_DISABLED`. |
+| HTTP instrumentation | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.72.0 | 2026-10-02 | Contrib modules version separately from the core SDK. Names spans and sets `http.route` from `Request.Pattern`, which chi only sets on its own request copy; see phase 6 notes. |
+| Runtime metrics | `go.opentelemetry.io/contrib/instrumentation/runtime` | v0.72.0 | 2026-10-02 | Goroutines, memory, GC. |
+| pgx instrumentation | `github.com/exaring/otelpgx` | v0.13.0 | 2026-10-08 | Query, prepare, copy, connect and pool-acquire spans, `db.client.operation.duration`, pool stats. Spans only under a recording parent. |
+| Local telemetry backends | `otel/opentelemetry-collector`, `jaegertracing/jaeger`, `prom/prometheus` | 0.164.0, 2.22.0, v3.15.1 | 2026-10 | Core collector distro is enough (OTLP receiver, `otlp_grpc`, prometheus and debug exporters). Jaeger v2 all-in-one takes OTLP directly. |
 | Validation | `github.com/go-playground/validator/v10` | v10.30.5 | 2026-09-20 | Only needed if not using Huma. |
 | JWT / JWK | `github.com/lestrrat-go/jwx/v4` | v4.6.0 | 2026-10-23 | v4 is current. v3 (v3.4.0) still receives releases but new code should start on v4. |
 | OIDC | `github.com/coreos/go-oidc/v3` | v3.21.0 | 2026-09-01 | Delegate auth to an identity provider. |
@@ -98,14 +101,14 @@ go-backend/
       queries/             # *.sql consumed by sqlc
       sqlc/                # generated, committed, never edited by hand
     platform/
-      otel/
+      otelx/                 # named like slogx so it imports next to go.opentelemetry.io/otel
       slogx/
   migrations/
     0001_init.sql
   api/
     openapi.yaml           # exported from Huma in CI, or hand-written if spec-first
   deploy/
-    docker-compose.yml     # local Postgres plus otel-collector
+    docker-compose.yml     # local Postgres; collector, Jaeger, Prometheus behind a profile
   test/
     integration/           # testcontainers-based end-to-end tests
 ```

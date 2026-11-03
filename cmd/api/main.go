@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -23,8 +24,23 @@ import (
 	"github.com/vanthao03596/go-backend/internal/config"
 	"github.com/vanthao03596/go-backend/internal/db"
 	"github.com/vanthao03596/go-backend/internal/db/sqlc"
+	"github.com/vanthao03596/go-backend/internal/platform/otelx"
 	"github.com/vanthao03596/go-backend/internal/platform/slogx"
 )
+
+// serviceName is the default OpenTelemetry service.name. OTEL_SERVICE_NAME
+// overrides it.
+const serviceName = "shortener"
+
+// maxTelemetryShutdown caps the final span and metric export at exit. With
+// the default SHUTDOWN_TIMEOUT of 10s the worst case after SIGTERM is then
+// 10s (HTTP drain) + 10s (click flush) + 5s, inside a 30s grace period.
+const maxTelemetryShutdown = 5 * time.Second
+
+// version is reported as service.version. Release builds set it with
+// -ldflags "-X main.version=<tag or sha>"; when empty, otelx.Version falls
+// back to the build info stamped by go build.
+var version string
 
 const usage = `usage:
   api                       start the HTTP server
@@ -54,34 +70,85 @@ func run(args []string, stdout io.Writer) error {
 }
 
 // bootstrap loads config, builds the logger and opens the pool. Logs go to
-// logOut so the apikey subcommand can keep stdout for the key alone.
+// logOut so the apikey subcommand can keep stdout for the key alone. The
+// operator subcommands that use it are not traced.
 func bootstrap(ctx context.Context, logOut io.Writer) (config.Config, *slog.Logger, *pgxpool.Pool, error) {
-	cfg, err := config.Load()
+	cfg, log, err := loadConfig(logOut)
 	if err != nil {
 		return config.Config{}, nil, nil, err
 	}
-	level, _ := cfg.SlogLevel()
-	log := slogx.New(logOut, level, cfg.IsDev())
-	slog.SetDefault(log)
-
-	pool, err := db.NewPool(ctx, cfg.DatabaseURL, db.PoolOptions{
-		MaxConns:        cfg.DB.MaxConns,
-		MinConns:        cfg.DB.MinConns,
-		MaxConnLifetime: cfg.DB.MaxConnLifetime,
-		MaxConnIdleTime: cfg.DB.MaxConnIdleTime,
-		ConnectTimeout:  cfg.DB.ConnectTimeout,
-	})
+	pool, err := openPool(ctx, cfg, otelx.Disabled())
 	if err != nil {
 		return config.Config{}, nil, nil, err
 	}
 	return cfg, log, pool, nil
 }
 
+// loadConfig reads the environment and installs the process logger.
+func loadConfig(logOut io.Writer) (config.Config, *slog.Logger, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return config.Config{}, nil, err
+	}
+	level, _ := cfg.SlogLevel()
+	log := slogx.New(logOut, level, cfg.IsDev())
+	slog.SetDefault(log)
+	return cfg, log, nil
+}
+
+// openPool connects to Postgres, reporting query spans and pool metrics to tel.
+func openPool(ctx context.Context, cfg config.Config, tel *otelx.Telemetry) (*pgxpool.Pool, error) {
+	return db.NewPool(ctx, cfg.DatabaseURL, db.PoolOptions{
+		MaxConns:        cfg.DB.MaxConns,
+		MinConns:        cfg.DB.MinConns,
+		MaxConnLifetime: cfg.DB.MaxConnLifetime,
+		MaxConnIdleTime: cfg.DB.MaxConnIdleTime,
+		ConnectTimeout:  cfg.DB.ConnectTimeout,
+		TracerProvider:  tel.TracerProvider,
+		MeterProvider:   tel.MeterProvider,
+	})
+}
+
 func serve() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, log, pool, err := bootstrap(ctx, os.Stdout)
+	cfg, log, err := loadConfig(os.Stdout)
+	if err != nil {
+		return err
+	}
+
+	serviceVersion := otelx.Version(version)
+	tel, err := otelx.Setup(ctx, otelx.Config{
+		Enabled:        cfg.Telemetry.Enabled,
+		ServiceName:    serviceName,
+		ServiceVersion: serviceVersion,
+		Environment:    cfg.Env,
+		Log:            log,
+	})
+	if err != nil {
+		return err
+	}
+	// Deferred first so it runs last: after the server has drained and the
+	// click buffer has flushed, so their final spans are exported too. The
+	// signal context is cancelled by then, hence a fresh budget, kept short
+	// because Server.Shutdown may already have spent twice SHUTDOWN_TIMEOUT
+	// and the orchestrator's grace period is counting. Telemetry is best
+	// effort; a collector that is down at exit is logged, not fatal.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(),
+			min(cfg.ShutdownTimeout, maxTelemetryShutdown))
+		defer cancel()
+		if err := tel.Shutdown(shutdownCtx); err != nil {
+			log.Warn("telemetry shutdown", "err", err)
+		}
+	}()
+	if cfg.Telemetry.Enabled {
+		log.Info("telemetry enabled: exporting traces and metrics over OTLP gRPC",
+			"service_version", serviceVersion)
+	}
+
+	pool, err := openPool(ctx, cfg, tel)
 	if err != nil {
 		return err
 	}
@@ -94,7 +161,7 @@ func serve() error {
 		}
 	}
 
-	srv := app.New(cfg, log, pool)
+	srv := app.New(cfg, log, pool, app.WithTelemetry(tel.TracerProvider, tel.MeterProvider))
 	if len(cfg.TrustedProxies) == 0 {
 		log.Info("no TRUSTED_PROXIES set: client IP is the TCP peer")
 	} else {
